@@ -1614,11 +1614,14 @@ async def execute_antigravity(
                 ws_root = session_data.get("workspace_root")
                 allowed_dirs = [active_project, ws_root]
                 
-                await _feishu_call(
+                cleaned = await _feishu_call(
                     lambda: extract_and_upload_resources(reply_text, message_id, api_client, allowed_dirs, chat_id=chat_id),
                     timeout=120.0,
                     label="extract_and_upload_resources"
                 )
+                # Bridge-like: keep prose on the card; media already sent as native msgs
+                if isinstance(cleaned, str) and cleaned.strip():
+                    reply_text = cleaned
                 
                 if os.path.exists(log_file_path):
                     await _sync_conversation_id_from_log(log_file_path)

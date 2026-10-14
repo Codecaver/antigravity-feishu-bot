@@ -16,8 +16,9 @@ import re
 from typing import Iterator, Tuple
 
 
+_MD_IMAGE = re.compile(r"!\[([^\]]*)\]\((?:file://)?([^)]+)\)")
 _FILE_MD_LINK = re.compile(
-    r"\[(?:file:///)?([^\]]+)\]\((?:file://)?(/?[^\s\)]+)\)",
+    r"(?<!!)\[(?:file:///)?([^\]]+)\]\((?:file://)?(/?[^\s\)]+)\)",
     re.IGNORECASE,
 )
 _BARE_FILE_URL = re.compile(r"file://(/[^\s\)\]\>]+)", re.IGNORECASE)
@@ -67,6 +68,15 @@ def _short_path(path: str) -> str:
 def _sanitize_prose(text: str) -> str:
     """Sanitize non-code markdown for Feishu cards."""
 
+    def _img_sub(m: re.Match) -> str:
+        # Feishu cards need image_key; local/http markdown images break patch (11310).
+        target = (m.group(2) or "").strip()
+        if target.startswith(("http://", "https://", "img_v")):
+            alt = (m.group(1) or "").strip() or "图片"
+            return f"（{alt}）"
+        alt = (m.group(1) or "").strip() or os.path.basename(target.replace("file://", "")) or "图片"
+        return f"（{alt}）"
+
     def _link_sub(m: re.Match) -> str:
         label, target = m.group(1), m.group(2)
         pretty = _pretty_path(target)
@@ -79,7 +89,8 @@ def _sanitize_prose(text: str) -> str:
                 pretty = alt
         return f"`{pretty}`"
 
-    out = _FILE_MD_LINK.sub(_link_sub, text)
+    out = _MD_IMAGE.sub(_img_sub, text)
+    out = _FILE_MD_LINK.sub(_link_sub, out)
     out = _ANGLE_FILE.sub(lambda m: f"`{_pretty_path(m.group(1))}`", out)
     out = _BARE_FILE_URL.sub(lambda m: f"`{_pretty_path(m.group(1))}`", out)
 

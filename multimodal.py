@@ -10,13 +10,57 @@ from config import get_brain_dir
 from lark_client import upload_file_sdk, reply_file_sdk, reply_voice_sdk, send_file_to_chat_sdk, send_voice_to_chat_sdk
 
 
+_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic"}
+
+
+def _strip_local_media_markdown(text: str, delivered_abs: set) -> str:
+    """Remove local ![ ](path) / [ ](path) once media was sent as Feishu messages (bridge-like)."""
+    if not text:
+        return text
+
+    def _norm(p: str) -> str:
+        return os.path.abspath((p or "").replace("file://", "").strip())
+
+    def _img_sub(m: re.Match) -> str:
+        target = m.group(2).strip()
+        if target.startswith(("http://", "https://")):
+            return m.group(0)
+        try:
+            if _norm(target) in delivered_abs or os.path.exists(_norm(target)):
+                alt = (m.group(1) or "").strip() or "图片"
+                return f"（{alt}已发送）"
+        except Exception:
+            pass
+        return m.group(0)
+
+    def _file_sub(m: re.Match) -> str:
+        target = m.group(2).strip()
+        if target.startswith(("http://", "https://")):
+            return m.group(0)
+        try:
+            abs_t = _norm(target)
+            if abs_t in delivered_abs:
+                label = (m.group(1) or "").strip() or os.path.basename(abs_t)
+                return f"（{label}已发送）"
+        except Exception:
+            pass
+        return m.group(0)
+
+    out = re.sub(r"!\[([^\]]*)\]\((?:file://)?([^)]+)\)", _img_sub, text)
+    out = re.sub(r"(?<!!)\[([^\]]*)\]\((?:file://)?([^)]+)\)", _file_sub, out)
+    return out
+
+
 def extract_and_upload_resources(text, message_id, api_client, additional_safe_dirs=None, chat_id=None):
     """
     Scans `text` for image and file references and automatically uploads
     and delivers them into Feishu chat using official Lark OpenAPI.
+
+    Returns markdown with delivered local media refs replaced by short notes,
+    so the CardKit final card does not embed bare local paths (bridge-like).
     """
     if not text:
-        return
+        return text
 
     images = [
         img for img in re.findall(r'!\[.*?\]\((?:file://)?([^)]+)\)', text)
@@ -27,6 +71,7 @@ def extract_and_upload_resources(text, message_id, api_client, additional_safe_d
         for label, f in re.findall(r'(?<!!)\[(.*?)\]\((?:file://)?([^)]+)\)', text)
         if not f.startswith(('http://', 'https://'))
     ]
+    delivered_abs = set()
 
     workspace_dir = os.path.dirname(os.path.abspath(__file__))
     tmp_dir = tempfile.gettempdir()
@@ -81,36 +126,46 @@ def extract_and_upload_resources(text, message_id, api_client, additional_safe_d
             except Exception as e:
                 log.error(f"[Multimodal] Error scanning md file: {e}")
 
-    # 1. Upload Images
-    for img_path in set(images):
+    def _send_image(img_path: str) -> bool:
+        abs_img = os.path.abspath(img_path)
+        if abs_img in delivered_abs:
+            return True
         if not is_safe_path(img_path):
             log.warning(f"[Multimodal] Blocked unsafe image upload path: {img_path}")
-            continue
-        if os.path.exists(img_path):
-            try:
-                with open(img_path, "rb") as f:
-                    req = lark.api.im.v1.CreateImageRequest.builder().request_body(
-                        lark.api.im.v1.CreateImageRequestBody.builder().image_type("message").image(f).build()
-                    ).build()
-                    resp = api_client.im.v1.image.create(req)
-                if resp.code == 0:
-                    img_key = json.loads(resp.raw.content).get('data', {}).get('image_key')
-                    if img_key:
-                        log.info(f"[Multimodal] Image uploaded successfully, image_key: {img_key}")
-                        if message_id and str(message_id).startswith("om_"):
-                            msg_req = lark.api.im.v1.ReplyMessageRequest.builder().message_id(message_id).request_body(
-                                lark.api.im.v1.ReplyMessageRequestBody.builder().msg_type("image").content(json.dumps({"image_key": img_key})).build()
-                            ).build()
-                            api_client.im.v1.message.reply(msg_req)
-                        elif chat_id:
-                            msg_req = lark.api.im.v1.CreateMessageRequest.builder().receive_id_type("chat_id").request_body(
-                                lark.api.im.v1.CreateMessageRequestBody.builder().receive_id(chat_id).msg_type("image").content(json.dumps({"image_key": img_key})).build()
-                            ).build()
-                            api_client.im.v1.message.create(msg_req)
-                else:
-                    log.error(f"[Multimodal] Failed to upload image: {resp.msg}")
-            except Exception as e:
-                log.error(f"[Multimodal] Error uploading image: {e}")
+            return False
+        if not os.path.exists(img_path):
+            return False
+        try:
+            with open(img_path, "rb") as f:
+                req = lark.api.im.v1.CreateImageRequest.builder().request_body(
+                    lark.api.im.v1.CreateImageRequestBody.builder().image_type("message").image(f).build()
+                ).build()
+                resp = api_client.im.v1.image.create(req)
+            if resp.code == 0:
+                img_key = json.loads(resp.raw.content).get('data', {}).get('image_key')
+                if img_key:
+                    log.info(f"[Multimodal] Image uploaded successfully, image_key: {img_key}")
+                    if message_id and str(message_id).startswith("om_"):
+                        msg_req = lark.api.im.v1.ReplyMessageRequest.builder().message_id(message_id).request_body(
+                            lark.api.im.v1.ReplyMessageRequestBody.builder().msg_type("image").content(json.dumps({"image_key": img_key})).build()
+                        ).build()
+                        api_client.im.v1.message.reply(msg_req)
+                    elif chat_id:
+                        msg_req = lark.api.im.v1.CreateMessageRequest.builder().receive_id_type("chat_id").request_body(
+                            lark.api.im.v1.CreateMessageRequestBody.builder().receive_id(chat_id).msg_type("image").content(json.dumps({"image_key": img_key})).build()
+                        ).build()
+                        api_client.im.v1.message.create(msg_req)
+                    delivered_abs.add(abs_img)
+                    return True
+            else:
+                log.error(f"[Multimodal] Failed to upload image: {resp.msg}")
+        except Exception as e:
+            log.error(f"[Multimodal] Error uploading image: {e}")
+        return False
+
+    # 1. Upload Images (as image messages only — never also as file)
+    for img_path in set(images):
+        _send_image(img_path)
 
     # 2. Upload Files / Audio
     uploaded_files = set()
@@ -124,6 +179,12 @@ def extract_and_upload_resources(text, message_id, api_client, additional_safe_d
         abs_file = os.path.abspath(file_path)
         _, ext = os.path.splitext(abs_file)
         ext_lower = ext.lower()
+
+        # Same asset already sent as image, or image linked via [label](path.jpg)
+        if abs_file in delivered_abs or ext_lower in _IMAGE_EXTS:
+            if ext_lower in _IMAGE_EXTS:
+                _send_image(file_path)
+            continue
 
         # 判断是否属于明确要求发送/导出的文件：
         # 1. 最近 15 分钟内新创建或修改的文件（大模型本次任务现场生成的交付物）
@@ -199,7 +260,10 @@ def extract_and_upload_resources(text, message_id, api_client, additional_safe_d
                         ok = reply_file_sdk(message_id, file_key) if (message_id and str(message_id).startswith("om_")) else False
                         if not ok and chat_id:
                             send_file_to_chat_sdk(chat_id, file_key)
+                    delivered_abs.add(abs_file)
                 else:
                     log.error(f"[Multimodal] Failed to upload file via Lark API: {abs_file}")
             except Exception as e:
                 log.error(f"[Multimodal] Error uploading file {abs_file}: {e}")
+
+    return _strip_local_media_markdown(text, delivered_abs)
