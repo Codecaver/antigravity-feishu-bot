@@ -209,23 +209,21 @@ def _summary_text(state: Dict[str, Any], max_chars: int = 40) -> str:
 
 
 def _stop_button(run_id: str, chat_id: str) -> dict:
+    # CardKit schema 2.0: button 直接放 elements，禁止再包 tag:action
     return {
-        "tag": "action",
-        "actions": [
+        "tag": "button",
+        "element_id": "btn_stop",
+        "text": {"tag": "plain_text", "content": "⏹ 停止"},
+        "type": "danger",
+        "width": "default",
+        "behaviors": [
             {
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": "⏹ 停止"},
-                "type": "danger",
-                "behaviors": [
-                    {
-                        "type": "callback",
-                        "value": {
-                            "action": "stop_run",
-                            "run_id": run_id,
-                            "chat_id": chat_id,
-                        },
-                    }
-                ],
+                "type": "callback",
+                "value": {
+                    "action": "stop_run",
+                    "run_id": run_id,
+                    "chat_id": chat_id,
+                },
             }
         ],
     }
@@ -233,23 +231,20 @@ def _stop_button(run_id: str, chat_id: str) -> dict:
 
 def _retry_button(run_id: str, chat_id: str, user_text: str) -> dict:
     return {
-        "tag": "action",
-        "actions": [
+        "tag": "button",
+        "element_id": "btn_retry",
+        "text": {"tag": "plain_text", "content": "🔄 重试"},
+        "type": "primary",
+        "width": "default",
+        "behaviors": [
             {
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": "🔄 重试"},
-                "type": "primary",
-                "behaviors": [
-                    {
-                        "type": "callback",
-                        "value": {
-                            "action": "retry_run",
-                            "run_id": run_id,
-                            "chat_id": chat_id,
-                            "user_text": (user_text or "")[:2000],
-                        },
-                    }
-                ],
+                "type": "callback",
+                "value": {
+                    "action": "retry_run",
+                    "run_id": run_id,
+                    "chat_id": chat_id,
+                    "user_text": (user_text or "")[:2000],
+                },
             }
         ],
     }

@@ -1892,8 +1892,8 @@ async def execute_antigravity(
                                         },
                                     }],
                                 })
-                            if btns:
-                                extra.append({"tag": "action", "actions": btns})
+                            # CardKit 2.0: 按钮直接进 elements，勿包 tag:action
+                            extra.extend(btns)
                         if is_error:
                             ok = await _feishu_call(
                                 lambda: run_session.finish_error(reply_text or "执行失败"),
