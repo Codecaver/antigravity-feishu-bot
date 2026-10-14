@@ -1,15 +1,17 @@
-"""Active run session: reduce events → throttled CardKit full-card updates."""
+"""Active run session: reduce events → smooth CardKit streaming updates."""
 
 from __future__ import annotations
 
 import threading
 import time
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
+
 from bridge_core.run_renderer import render_card
 from bridge_core.run_state import assistant_text, create_initial_state, reduce
 from lark_stream import StreamingMarkdownCard, create_card_entity, reply_card_by_ref
 from logger import log
+from utils.feishu_markdown import sanitize_feishu_markdown
 
 # chat_id → RunSession
 _ACTIVE: Dict[str, "RunSession"] = {}
@@ -33,6 +35,35 @@ def get_active_run(chat_id: str) -> Optional["RunSession"]:
         return _ACTIVE.get(chat_id)
 
 
+def _structure_signature(state: Dict[str, Any], elements_extra: Optional[list] = None) -> Tuple:
+    """Fingerprint of card layout (not body text). Text-only changes keep this stable."""
+    tools = []
+    has_body = False
+    for b in state.get("blocks") or []:
+        if b.get("kind") == "tool":
+            t = b.get("tool") or {}
+            tools.append((t.get("id"), t.get("status"), (t.get("label") or "")[:40]))
+        elif b.get("kind") == "text" and (b.get("content") or "").strip():
+            has_body = True
+    r = state.get("reasoning") or {}
+    act = state.get("activity") or {}
+    # reasoning 内容按 240 字分桶，避免每个 thinking delta 都整卡闪一下
+    r_bucket = len((r.get("content") or "")) // 240
+    return (
+        state.get("terminal") or "running",
+        bool(state.get("userText")),
+        has_body,
+        bool(r.get("content")),
+        bool(r.get("active")),
+        r_bucket,
+        tuple(tools),
+        act.get("phase") or "",
+        (act.get("label") or "")[:48],
+        bool(elements_extra),
+        len(elements_extra or []),
+    )
+
+
 class RunSession:
     """One Feishu CardKit card per agent run (bridge-like)."""
 
@@ -51,8 +82,11 @@ class RunSession:
         self.failed = False
         self.stop_requested = False
         self._last_push_at = 0.0
-        self._min_interval = 0.18
+        self._min_interval = 0.35  # 结构变化整卡替换节流
+        self._content_min_interval = 0.05  # 正文 element patch（打字机）
         self._dirty = False
+        self._last_structure_sig: Optional[Tuple] = None
+        self._body_ready = False  # md_body 已出现在卡上
         self.process = None  # subprocess / session handle for stop
 
     @property
@@ -86,6 +120,8 @@ class RunSession:
                 if not card:
                     return None
                 sess = cls(chat_id, card, state=state, run_id=run_id)
+                sess._body_ready = True  # 简易卡只有 md_body
+                sess._last_structure_sig = _structure_signature(state)
                 register_active_run(chat_id, sess)
                 return sess
             msg_id = reply_card_by_ref(reply_to_message_id, card_id)
@@ -93,6 +129,8 @@ class RunSession:
                 return None
             stream = StreamingMarkdownCard.attach(card_id, msg_id, sequence=0)
             sess = cls(chat_id, stream, state=state, run_id=run_id)
+            sess._body_ready = True  # render_card(running) 始终带 md_body
+            sess._last_structure_sig = _structure_signature(state)
             register_active_run(chat_id, sess)
             log.info(f"[RunSession] started run_id={run_id} card_id={card_id} msg={msg_id}")
             return sess
@@ -118,6 +156,8 @@ class RunSession:
         state["userText"] = user_text
         state["retryUserText"] = user_text
         sess = cls(chat_id, stream, state=state)
+        sess._body_ready = True
+        sess._last_structure_sig = _structure_signature(state)
         register_active_run(chat_id, sess)
         return sess
 
@@ -131,8 +171,30 @@ class RunSession:
         if self.failed or not self.card or self.card.failed:
             return False
         now = time.time()
-        terminal = self.state.get("terminal")
-        # Always flush terminal transitions; throttle running updates
+        terminal = self.state.get("terminal") or "running"
+        sig = _structure_signature(self.state, elements_extra)
+        structure_changed = self._last_structure_sig is None or sig != self._last_structure_sig
+
+        # 运行中且布局未变：只 patch md_body，走 CardKit 原生打字机（避免整卡闪段）
+        if (
+            terminal == "running"
+            and not structure_changed
+            and elements_extra is None
+            and self._body_ready
+        ):
+            if (not force) and (now - self._last_push_at) < self._content_min_interval:
+                self._dirty = True
+                return True
+            text = sanitize_feishu_markdown(assistant_text(self.state) or "…") or "…"
+            ok = self.card.set_content(text, force=True)
+            if not ok:
+                # element 可能丢了，退回整卡
+                return self._push_full(elements_extra=None, sig=sig)
+            self._last_push_at = time.time()
+            self._dirty = False
+            return True
+
+        # 终态 / 结构变化：整卡替换
         if (
             not force
             and terminal == "running"
@@ -140,15 +202,28 @@ class RunSession:
         ):
             self._dirty = True
             return True
+        return self._push_full(elements_extra=elements_extra, sig=sig)
+
+    def _push_full(
+        self,
+        force: bool = False,
+        elements_extra: Optional[list] = None,
+        sig: Optional[Tuple] = None,
+    ) -> bool:
         card_json = render_card(self.state, elements_extra=elements_extra)
         ok = self.card.replace_with_card(card_json)
         if not ok:
-            # Fallback: flatten to markdown body stream
             text = assistant_text(self.state) or _fallback_md(self.state)
             ok = self.card.set_content(text, force=True)
             if not ok:
                 self.failed = True
                 return False
+        else:
+            self._body_ready = True
+            if sig is not None:
+                self._last_structure_sig = sig
+            else:
+                self._last_structure_sig = _structure_signature(self.state, elements_extra)
         self._last_push_at = time.time()
         self._dirty = False
         return True

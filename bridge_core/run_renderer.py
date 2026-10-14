@@ -40,6 +40,17 @@ def render_card(state: Dict[str, Any], elements_extra: Optional[List[dict]] = No
         else:
             elements.extend(_render_tool_group(group.get("tools") or [], finalized=terminal != "running"))
 
+    # 运行中始终保留 md_body，便于后续只 patch 正文（打字机）而不整卡替换
+    if terminal == "running" and not body_added:
+        elements.append(
+            {
+                "tag": "markdown",
+                "element_id": "md_body",
+                "content": "…",
+            }
+        )
+        body_added = True
+
     # choice / 额外按钮放在「已完成」之前
     if elements_extra:
         elements.extend(elements_extra)
@@ -57,7 +68,13 @@ def render_card(state: Dict[str, Any], elements_extra: Optional[List[dict]] = No
     if terminal == "running":
         activity = _activity_text(state)
         if activity:
-            elements.append(_note(activity))
+            elements.append(
+                {
+                    "tag": "markdown",
+                    "element_id": "md_activity",
+                    "content": f"_{activity}_" if not activity.startswith("_") else activity,
+                }
+            )
         elements.append(_stop_button(state.get("runId") or "", state.get("chatId") or ""))
     elif state.get("runId") and terminal in ("error", "interrupted"):
         elements.append(
