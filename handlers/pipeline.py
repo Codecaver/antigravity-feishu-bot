@@ -547,7 +547,8 @@ async def _process_single_task(chat_id, task):
             "严禁把多行代码塞进单行反引号。\n"
             "4. 【禁止】`file://` / HTML；路径用反引号短路径，如 `cards/indicators.py`。\n"
             "5. 【生成图片】只写 `![简短说明](本地图片完整路径)`，**禁止**再调 `send_to_feishu.py`。\n"
-            "6. 非图片文件可用 `[名.xlsx](本地完整路径)` 交由系统投递。\n\n"
+            "6. 【生成文件】xlsx/pdf/docx 等只写 `[文件名](本地完整路径)`，由系统投递一次；"
+            "**禁止**再调 `send_to_feishu.py`，也禁止同一文件既 markdown 链接又手动推送。\n\n"
         )
 
         if task.get("message_type") == "audio" or task.get("is_voice_message"):

@@ -7,7 +7,15 @@ import subprocess
 import lark_oapi as lark
 from logger import log
 from config import get_brain_dir
-from lark_client import upload_file_sdk, reply_file_sdk, reply_voice_sdk, send_file_to_chat_sdk, send_voice_to_chat_sdk
+from lark_client import (
+    upload_file_sdk,
+    reply_file_sdk,
+    reply_voice_sdk,
+    send_file_to_chat_sdk,
+    send_voice_to_chat_sdk,
+    mark_media_sent,
+    was_media_recently_sent,
+)
 
 
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic"}
@@ -195,6 +203,12 @@ def extract_and_upload_resources(text, message_id, api_client, additional_safe_d
                 _send_image(file_path)
             continue
 
+        # Agent 已通过 send_to_feishu 推过同一文件 → 跳过，避免双发/三发
+        if was_media_recently_sent(abs_file):
+            log.info(f"[Multimodal] Skip already-sent file: {abs_file}")
+            delivered_abs.add(abs_file)
+            continue
+
         # 判断是否属于明确要求发送/导出的文件：
         # 1. 最近 15 分钟内新创建或修改的文件（大模型本次任务现场生成的交付物）
         # 2. 存放在 downloads/、scratch/ 或 tmp 交付目录下的文件
@@ -261,15 +275,18 @@ def extract_and_upload_resources(text, message_id, api_client, additional_safe_d
                 file_key = upload_file_sdk(abs_file, duration_ms=duration_ms)
                 if file_key:
                     log.info(f"[Multimodal] File uploaded to Lark API (key={file_key}, path={abs_file})")
+                    ok = False
                     if is_opus_voice:
                         ok = reply_voice_sdk(message_id, file_key) if (message_id and str(message_id).startswith("om_")) else False
                         if not ok and chat_id:
-                            send_voice_to_chat_sdk(chat_id, file_key)
+                            ok = send_voice_to_chat_sdk(chat_id, file_key)
                     else:
                         ok = reply_file_sdk(message_id, file_key) if (message_id and str(message_id).startswith("om_")) else False
                         if not ok and chat_id:
-                            send_file_to_chat_sdk(chat_id, file_key)
-                    delivered_abs.add(abs_file)
+                            ok = send_file_to_chat_sdk(chat_id, file_key)
+                    if ok:
+                        delivered_abs.add(abs_file)
+                        mark_media_sent(abs_file)
                 else:
                     log.error(f"[Multimodal] Failed to upload file via Lark API: {abs_file}")
             except Exception as e:
