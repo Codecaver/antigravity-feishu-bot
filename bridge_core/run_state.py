@@ -43,8 +43,15 @@ def _close_streaming_text(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
+_TERMINAL = frozenset({"done", "error", "interrupted"})
+
+
 def reduce(state: Dict[str, Any], evt: Dict[str, Any]) -> Dict[str, Any]:
     et = evt.get("type")
+    # 终态锁定：停止/完成后不再被 done/error/流式事件覆盖（避免 stop 后刷成失败）
+    if state.get("terminal") in _TERMINAL and et not in ("meta",):
+        return state
+
     if et == "meta":
         patch = {}
         if "userText" in evt:

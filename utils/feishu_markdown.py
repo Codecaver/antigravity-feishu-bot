@@ -23,6 +23,10 @@ _FILE_MD_LINK = re.compile(
 )
 _BARE_FILE_URL = re.compile(r"file://(/[^\s\)\]\>]+)", re.IGNORECASE)
 _ANGLE_FILE = re.compile(r"<(?:file://)?(/Users/[^\s>]+|/home/[^\s>]+|/tmp/[^\s>]+)>")
+# 裸绝对路径（思考面板/工具输出常见），缩短后包进反引号
+_BARE_ABS_PATH = re.compile(
+    r"(?<![`\w])((?:/Users|/home|/private/var|/var/folders|/tmp|/opt)/[^\s`\"'<>\]\)]+)"
+)
 
 # Closed fenced code block (language optional). Keep body untouched.
 _CLOSED_FENCE = re.compile(r"```([^\n`]*)\n([\s\S]*?)\n```")
@@ -93,6 +97,7 @@ def _sanitize_prose(text: str) -> str:
     out = _FILE_MD_LINK.sub(_link_sub, out)
     out = _ANGLE_FILE.sub(lambda m: f"`{_pretty_path(m.group(1))}`", out)
     out = _BARE_FILE_URL.sub(lambda m: f"`{_pretty_path(m.group(1))}`", out)
+    out = _BARE_ABS_PATH.sub(lambda m: f"`{_pretty_path(m.group(1))}`", out)
 
     # Headings → bold (Feishu mobile card markdown is weak on # headers)
     out = re.sub(r"^(#{1,6})\s*(.+)$", r"**\2**", out, flags=re.MULTILINE)

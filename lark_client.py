@@ -536,7 +536,10 @@ def send_local_file_as_reply(message_id, file_path, file_type=None, caption=None
                 .build()
             ).build()
             msg_resp = api_client.im.v1.message.reply(msg_req)
-            return msg_resp.code == 0
+            if msg_resp.code == 0:
+                mark_image_sent(file_path)
+                return True
+            return False
         except Exception as e:
             log.error(f"[send_local_file_as_reply] image error: {e}")
             return False

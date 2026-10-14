@@ -49,6 +49,7 @@ class RunSession:
         self.run_id = self.state["runId"]
         self.state["chatId"] = chat_id
         self.failed = False
+        self.stop_requested = False
         self._last_push_at = 0.0
         self._min_interval = 0.18
         self._dirty = False
@@ -163,6 +164,8 @@ class RunSession:
         reasoning: str = "",
         elements_extra: Optional[list] = None,
     ) -> bool:
+        if self.stop_requested or self.state.get("terminal") in ("interrupted", "done", "error"):
+            return self.push(force=True, elements_extra=elements_extra)
         self.apply(
             {"type": "done", "content": content, "reasoning": reasoning},
             push=False,
@@ -170,21 +173,24 @@ class RunSession:
         return self.push(force=True, elements_extra=elements_extra)
 
     def finish_error(self, message: str) -> bool:
+        if self.stop_requested or self.state.get("terminal") in ("interrupted", "done", "error"):
+            return self.push(force=True)
         self.apply({"type": "error", "message": message}, push=False)
         return self.push(force=True)
 
     def finish_interrupted(self) -> bool:
+        self.stop_requested = True
         self.apply({"type": "interrupted"}, push=False)
         return self.push(force=True)
 
     def request_stop(self) -> bool:
         """Best-effort kill attached process / mark interrupted."""
+        self.stop_requested = True
         proc = self.process
         stopped = False
         try:
             if proc is not None:
                 if hasattr(proc, "close") and callable(proc.close):
-                    # session_pool session
                     import asyncio
 
                     try:

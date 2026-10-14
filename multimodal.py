@@ -26,7 +26,8 @@ def _strip_local_media_markdown(text: str, delivered_abs: set) -> str:
         if target.startswith(("http://", "https://")):
             return m.group(0)
         try:
-            if _norm(target) in delivered_abs or os.path.exists(_norm(target)):
+            # 仅在真正投递成功后替换，避免上传失败仍显示「已发送」
+            if _norm(target) in delivered_abs:
                 alt = (m.group(1) or "").strip() or "图片"
                 return f"（{alt}已发送）"
         except Exception:

@@ -1223,7 +1223,12 @@ async def execute_antigravity(
                             if tdelta:
                                 accumulated_thinking += tdelta
                                 if run_session:
-                                    run_session.apply({"type": "thinking", "delta": tdelta}, push=True)
+                                    try:
+                                        from utils.feishu_markdown import sanitize_feishu_markdown
+                                        tdelta_ui = sanitize_feishu_markdown(tdelta) or tdelta
+                                    except Exception:
+                                        tdelta_ui = tdelta
+                                    run_session.apply({"type": "thinking", "delta": tdelta_ui}, push=True)
                         elif step_t == "agent_response":
                             delta = step_up.get("text_delta")
                             if delta:
@@ -1232,8 +1237,7 @@ async def execute_antigravity(
                                 if parsed_steps and parsed_steps != planned_steps:
                                     planned_steps = parsed_steps
                                     current_plan_idx = min(current_plan_idx, len(planned_steps) - 1)
-                                if run_session:
-                                    run_session.apply({"type": "text", "delta": delta}, push=True)
+                                # RunSession 正文由循环内 clean_partial → set_text 统一同步（避免 delta+全量双刷）
                             if current_tool_action:
                                 if current_tool_action not in completed_tool_steps:
                                     completed_tool_steps.append(current_tool_action)
@@ -1857,52 +1861,56 @@ async def execute_antigravity(
             if run_session and not run_session.failed and not is_voice_message:
                 try:
                     await _flush_cardkit_pushes()
-                    extra = []
-                    if choice_card_data and choice_card_data.get("options"):
-                        opts = "\n".join(
-                            f"{i}. {o}" for i, o in enumerate(choice_card_data["options"][:10], 1)
-                        )
-                        q = choice_card_data.get("question") or "请选择"
-                        extra.append({"tag": "hr"})
-                        extra.append({
-                            "tag": "markdown",
-                            "content": f"**{q}**\n\n{opts}\n\n_(点击下方按钮或直接回复选项)_",
-                        })
-                        btns = []
-                        for opt in choice_card_data["options"][:6]:
-                            label = (opt[:20] + "…") if len(opt) > 20 else opt
-                            btns.append({
-                                "tag": "button",
-                                "text": {"tag": "plain_text", "content": label},
-                                "type": "default",
-                                "behaviors": [{
-                                    "type": "callback",
-                                    "value": {
-                                        "action": "user_choice",
-                                        "choice": opt,
-                                        "label": label,
-                                    },
-                                }],
-                            })
-                        if btns:
-                            extra.append({"tag": "action", "actions": btns})
-                    if is_error:
-                        ok = await _feishu_call(
-                            lambda: run_session.finish_error(reply_text or "执行失败"),
-                            timeout=12.0,
-                            label="run_session finish_error",
-                        )
+                    # 用户已点停止：保持 interrupted，勿再刷成 done/error
+                    if getattr(run_session, "stop_requested", False) or run_session.state.get("terminal") == "interrupted":
+                        delivered_via_cardkit = True
                     else:
-                        ok = await _feishu_call(
-                            lambda: run_session.finish_done(
-                                reply_text or "_(空回复)_",
-                                reasoning=reasoning_text or "",
-                                elements_extra=extra or None,
-                            ),
-                            timeout=12.0,
-                            label="run_session finish_done",
-                        )
-                    delivered_via_cardkit = bool(ok)
+                        extra = []
+                        if choice_card_data and choice_card_data.get("options"):
+                            opts = "\n".join(
+                                f"{i}. {o}" for i, o in enumerate(choice_card_data["options"][:10], 1)
+                            )
+                            q = choice_card_data.get("question") or "请选择"
+                            extra.append({"tag": "hr"})
+                            extra.append({
+                                "tag": "markdown",
+                                "content": f"**{q}**\n\n{opts}\n\n_(点击下方按钮或直接回复选项)_",
+                            })
+                            btns = []
+                            for opt in choice_card_data["options"][:6]:
+                                label = (opt[:20] + "…") if len(opt) > 20 else opt
+                                btns.append({
+                                    "tag": "button",
+                                    "text": {"tag": "plain_text", "content": label},
+                                    "type": "default",
+                                    "behaviors": [{
+                                        "type": "callback",
+                                        "value": {
+                                            "action": "user_choice",
+                                            "choice": opt,
+                                            "label": label,
+                                        },
+                                    }],
+                                })
+                            if btns:
+                                extra.append({"tag": "action", "actions": btns})
+                        if is_error:
+                            ok = await _feishu_call(
+                                lambda: run_session.finish_error(reply_text or "执行失败"),
+                                timeout=12.0,
+                                label="run_session finish_error",
+                            )
+                        else:
+                            ok = await _feishu_call(
+                                lambda: run_session.finish_done(
+                                    reply_text or "_(空回复)_",
+                                    reasoning=reasoning_text or "",
+                                    elements_extra=extra or None,
+                                ),
+                                timeout=12.0,
+                                label="run_session finish_done",
+                            )
+                        delivered_via_cardkit = bool(ok)
                 except Exception as e:
                     log.warning(f"[Executor] RunSession final delivery failed: {e}")
             elif cardkit_stream and not cardkit_stream.failed and not is_voice_message:
