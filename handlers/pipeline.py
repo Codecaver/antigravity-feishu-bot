@@ -267,21 +267,50 @@ async def _process_single_task(chat_id, task):
         task.get("is_voice_message")
     )
     if not bot_reply_msg_id and not is_resumed:
-        init_card = CardBuilder.build_typing_indicator(
-            downloaded_file_name, download_success, user_text, is_voice=is_voice_message
-        )
-        try:
-            bot_reply_msg_id = await app_state.run_feishu_sync(
-                loop, lambda: send_interactive_card_sdk(message_id, init_card)
+        # 优先 CardKit 占位（与后续流式同一条消息，避免再发一张又撤回旧卡）
+        started_cardkit = False
+        if not is_voice_message and message_id and str(message_id).startswith("om_"):
+            try:
+                from lark_stream import StreamingMarkdownCard
+
+                from cards.indicators import build_cardkit_progress_markdown
+                early_md = build_cardkit_progress_markdown(
+                    user_text=user_text,
+                    think_seconds=0,
+                    is_voice=is_voice_message,
+                )
+                ck = await app_state.run_feishu_sync(
+                    loop, lambda: StreamingMarkdownCard.start_as_reply(message_id, early_md)
+                )
+                if ck and getattr(ck, "card_id", None) and getattr(ck, "message_id", None):
+                    bot_reply_msg_id = ck.message_id
+                    task["bot_reply_msg_id"] = bot_reply_msg_id
+                    task["cardkit_card_id"] = ck.card_id
+                    task["cardkit_sequence"] = ck.sequence
+                    started_cardkit = True
+                    try:
+                        save_pending_task(chat_id, task)
+                    except Exception:
+                        pass
+            except Exception as e:
+                log.warning(f"[Pipeline] Early CardKit placeholder failed: {e}")
+
+        if not started_cardkit:
+            init_card = CardBuilder.build_typing_indicator(
+                downloaded_file_name, download_success, user_text, is_voice=is_voice_message
             )
-            if bot_reply_msg_id:
-                task["bot_reply_msg_id"] = bot_reply_msg_id
-                try:
-                    save_pending_task(chat_id, task)
-                except Exception:
-                    pass
-        except Exception as e:
-            log.warning(f"[Pipeline] Failed to send early typing card for chat {chat_id}: {e}")
+            try:
+                bot_reply_msg_id = await app_state.run_feishu_sync(
+                    loop, lambda: send_interactive_card_sdk(message_id, init_card)
+                )
+                if bot_reply_msg_id:
+                    task["bot_reply_msg_id"] = bot_reply_msg_id
+                    try:
+                        save_pending_task(chat_id, task)
+                    except Exception:
+                        pass
+            except Exception as e:
+                log.warning(f"[Pipeline] Failed to send early typing card for chat {chat_id}: {e}")
 
     # 先预热上一轮的档位，与 Jev 判定并行；若新档位不同，判定后再切到精确档位。
     prewarm_task = None
@@ -317,17 +346,23 @@ async def _process_single_task(chat_id, task):
     # 纯语义判定自适应思考层级（基于 System One 对上下文与待办任务的认知评估）
     adaptive_tier = evaluate_adaptive_tier(decision)
 
+    from config import DEFAULT_MODEL
+    # 未手动 /model 切换时，跟随 .env DEFAULT_MODEL，避免旧会话卡在 3.7 而配置已是 3.8
+    if session_data.get("model_user_override"):
+        base_model = session_data.get("base_model") or DEFAULT_MODEL
+    else:
+        base_model = DEFAULT_MODEL
     if adaptive_tier:
         session_data["typesafe_adaptive_tier"] = adaptive_tier
-        base_model = session_data.get("base_model") or session_data.get("model", "")
         session_data["base_model"] = base_model
         session_data["model"] = resolve_adaptive_model(base_model, adaptive_tier)
         session_data["reasoning_effort"] = adaptive_tier.lower()
     else:
         session_data.pop("typesafe_adaptive_tier", None)
-        if "base_model" in session_data:
-            session_data["model"] = session_data["base_model"]
+        session_data["base_model"] = base_model
+        session_data["model"] = base_model
         session_data["reasoning_effort"] = "medium"
+    await save_session_async(chat_id, session_data)
 
     selected_model = session_data.get("model", "Default")
     selected_effort = session_data.get("reasoning_effort", "medium")
@@ -484,9 +519,9 @@ async def _process_single_task(chat_id, task):
         system_instruction = (
             "[System Rule: MUST ALWAYS communicate, reply, explain, and write responses in Simplified Chinese (简体中文). "
             "Any English text in the response must be limited to code syntax or technical names only. "
-            "Absolute directive: NEVER output internal chain-of-thought, reasoning steps, planning commentary, or English preambles. "
-            "Output ONLY your final answer directly in Simplified Chinese.]\n\n"
+            "最终对用户可见的正文用简体中文直接回答；如需短暂推理，请放在 <thinking>...</thinking> 中，系统会单独折叠展示。]\n\n"
             "[Role: A friendly, concise and warm AI assistant. Reply naturally and warmly in 1-2 natural sentences without calling tools or explaining technical rules.]\n\n"
+            "[Feishu Style] 禁止 file:// 链接与绝对路径 Markdown；文件路径用反引号相对路径。\n\n"
             "[System One Adaptive Reasoning: LOW]\n"
             "当前任务判定为轻量日常问答或闲聊，请以极简快速思考直接给出精炼回答，避免冗长思考与过度分析。\n\n"
         )
@@ -499,14 +534,20 @@ async def _process_single_task(chat_id, task):
         system_instruction = (
             "[System Rule: MUST ALWAYS communicate, reply, explain, and write responses in Simplified Chinese (简体中文). "
             "Any English text in the response must be limited to code syntax or technical names only. "
-            "Absolute directive: NEVER output internal chain-of-thought, reasoning steps, planning commentary, or English preambles. "
-            "Output ONLY your final answer directly in Simplified Chinese.]\n\n"
+            "最终答复正文用简体中文直接给出；推理/排查过程请包在 <thinking>...</thinking> 标签内（可中英混合），"
+            "系统会在飞书卡片中以「思考完成，点击查看」折叠面板保留展示，勿把长推理堆进正文。]\n\n"
         )
 
         system_instruction += (
-            "[System Feishu Resource Delivery / 飞书文件传送规范]\n"
-            "1. 【统一使用飞书官方推送】：向用户提供文件时，请在最终回复中直接以标准 Markdown 链接输出该文件的本地绝对路径（例如 `[导出报告.xlsx](/path/to/file.xlsx)` 或 `📄 [文档.md](/path/to/doc.md)`），系统后台会自动拦截该路径并调用飞书官方 API 原生推送到当前会话供用户点击下载。严禁在脚本中私自 curl/webhook 传文件。\n"
-            "2. 【命令行主动发送】：在终端脚本中如需主动传送文件，可直接运行 `python3 send_to_feishu.py <文件路径>`。\n\n"
+            "[System Feishu Reply Style / 飞书消息排版规范]\n"
+            "1. 回复显示在飞书卡片：简体中文短段落；多条说明用有序序列 `1. 2. 3.`（不要用 `•`/`·` 圆点）。\n"
+            "2. 代码必须用标准围栏，且语言标记单独成行，例如：\n"
+            "```python\nprint('hi')\n```\n"
+            "严禁把代码塞进单行反引号；围栏内保持缩进，不要改写成列表。\n"
+            "3. 【禁止】`file://`、`vscode://`、`[file:///...](file:///...)`。"
+            "文件路径写相对路径反引号，如 `cards/indicators.py:538-585`。\n"
+            "4. 【禁止】HTML、嵌套怪链。需要发文件下载时用 `[名.xlsx](/绝对路径/文件.xlsx)`（不要 file://），"
+            "或 `python3 send_to_feishu.py <路径>`。\n\n"
         )
 
         if task.get("message_type") == "audio" or task.get("is_voice_message"):
@@ -588,6 +629,16 @@ async def _process_single_task(chat_id, task):
                 "[System One Adaptive Reasoning: MEDIUM]\n"
                 "当前任务判定为常规工程开发，兼顾思考深度与响应效率。\n\n"
             )
+
+        # 卡片脚注用的就是这次 CLI --model；禁止模型自称其它版本号
+        actual_model = session_data.get("model") or DEFAULT_MODEL
+        system_instruction += (
+            "[Runtime Model — authoritative]\n"
+            f"- This turn's CLI model id is exactly: `{actual_model}`\n"
+            "- When asked what model you are / which model is running, answer with this exact id "
+            "(and its human-readable family, e.g. Gemini 3.8 Flash if the id contains 3.8). "
+            "Do not invent a different version number.\n\n"
+        )
     
     # Load long-term memory if this is a new conversation (engineering/task mode only)
     final_prompt = user_text
@@ -604,6 +655,10 @@ async def _process_single_task(chat_id, task):
         import sys, importlib
         if "config" in sys.modules:
             importlib.reload(sys.modules["config"])
+        if "cards.common" in sys.modules:
+            importlib.reload(sys.modules["cards.common"])
+        if "cards.response" in sys.modules:
+            importlib.reload(sys.modules["cards.response"])
         if "cards.indicators" in sys.modules:
             importlib.reload(sys.modules["cards.indicators"])
         if "cards" in sys.modules:

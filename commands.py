@@ -231,6 +231,74 @@ class PendingCommand(str, Enum):
     TYPESAFE_SET_KEY = "typesafe_set_key"
     TYPESAFE_SET_BASE_URL = "typesafe_set_base_url"
 
+
+async def _start_app_scope_grant(message_id: str, chat_id: str, feature: str) -> None:
+    """Kick off register_app grant poller and push QR/link card into Feishu chat."""
+    import asyncio
+    from wizard import FEATURE_PACKS, start_grant_in_background
+    from lark_client import (
+        send_card_to_chat_sdk,
+        send_interactive_card_sdk,
+        send_reply_sdk,
+    )
+
+    feature = (feature or "base").strip().lower()
+    if feature not in FEATURE_PACKS:
+        known = ", ".join(FEATURE_PACKS)
+        await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: send_reply_sdk(message_id, f"❌ 未知能力包 `{feature}`。可选：{known}"),
+        )
+        return
+
+    pack = FEATURE_PACKS[feature]
+    title = pack["title"]
+    loop = asyncio.get_running_loop()
+
+    await loop.run_in_executor(
+        None,
+        lambda: send_reply_sdk(
+            message_id,
+            f"🔐 正在申请能力包 **{title}**（`{feature}`）…确认链接稍后发出。",
+        ),
+    )
+
+    def on_qr_code(info: dict) -> None:
+        url = info.get("url") or ""
+        expire_in = int(info.get("expire_in") or 600)
+        card = CardBuilder.build_scope_grant_link_card(feature, title, url, expire_in)
+        # Prefer chat push so the link remains visible if reply patch races.
+        try:
+            send_card_to_chat_sdk(chat_id, card)
+        except Exception:
+            send_interactive_card_sdk(message_id, card)
+
+    def on_done(result, err) -> None:
+        if err is not None:
+            detail = f"授权失败或已取消：`{type(err).__name__}: {err}`"
+            card = CardBuilder.build_scope_grant_result_card(False, title, detail)
+        else:
+            detail = (
+                f"能力包 **{title}** 已在确认页完成。\n\n"
+                "若开放平台要求**发布新版本**后权限才生效，请到开发者后台发布一次。"
+            )
+            card = CardBuilder.build_scope_grant_result_card(True, title, detail)
+        try:
+            send_card_to_chat_sdk(chat_id, card)
+        except Exception as send_err:
+            log.error(f"[grant] failed to send result card: {send_err}")
+
+    started = start_grant_in_background(feature, on_qr_code=on_qr_code, on_done=on_done)
+    if not started:
+        await loop.run_in_executor(
+            None,
+            lambda: send_reply_sdk(
+                message_id,
+                "⏳ 已有授权流程在进行中。可发送 `/grant cancel` 取消后再试。",
+            ),
+        )
+
+
 async def handle_slash_command(user_text, message_id, chat_id, session_data, running_processes, chat_queues, chat_workers=None):
     log.info(f"handle_slash_command call: user_text='{user_text}', pending_command='{session_data.get('pending_command')}'")
     """
@@ -594,6 +662,51 @@ async def handle_slash_command(user_text, message_id, chat_id, session_data, run
     elif user_text.strip() == "/auth":
         reply_text = "✅ 当前会话已授权，无需申请。"
         await asyncio.get_running_loop().run_in_executor(None, lambda: send_reply_sdk(message_id, reply_text))
+        return True, user_text
+
+    elif user_text.startswith("/grant"):
+        # 注意：勿在本函数内再 `from utils.auth import is_admin`，会把全函数 is_admin 变成局部变量并触发 UnboundLocalError
+        from wizard import (
+            FEATURE_PACKS,
+            cancel_active_grant,
+            list_feature_packs,
+            start_grant_in_background,
+        )
+        from config import APP_ID
+
+        if not is_admin(chat_id):
+            await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: send_reply_sdk(message_id, "🔒 `/grant` 仅管理员可用（开放平台应用权限）。"),
+            )
+            return True, user_text
+
+        args = user_text[len("/grant"):].strip().lower()
+        if not args:
+            panel = CardBuilder.build_scope_panel_card(list_feature_packs(), current_app_id=APP_ID or "")
+            await asyncio.get_running_loop().run_in_executor(
+                None, lambda: send_interactive_card_sdk(message_id, panel)
+            )
+            return True, user_text
+
+        if args in ("cancel", "stop"):
+            ok = cancel_active_grant()
+            msg = "✅ 已请求取消当前扫码授权等待。" if ok else "当前没有进行中的授权等待。"
+            await asyncio.get_running_loop().run_in_executor(
+                None, lambda: send_reply_sdk(message_id, msg)
+            )
+            return True, user_text
+
+        feature = args.split()[0]
+        if feature not in FEATURE_PACKS:
+            known = ", ".join(FEATURE_PACKS)
+            await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: send_reply_sdk(message_id, f"❌ 未知能力包 `{feature}`。可选：{known}"),
+            )
+            return True, user_text
+
+        await _start_app_scope_grant(message_id, chat_id, feature)
         return True, user_text
 
     elif user_text.startswith("/user"):

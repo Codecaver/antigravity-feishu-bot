@@ -69,7 +69,20 @@ def do_p2_card_action_trigger(data: P2CardActionTrigger) -> P2CardActionTriggerR
     if action_value.get("action") in plugin_write_actions:
         if not is_admin(chat_id):
             return P2CardActionTriggerResponse({"toast": {"type": "error", "content": "🔒 此操作仅管理员可用！"}})
-        
+
+    if action_value.get("action") == "app_scope_grant":
+        if not is_admin(chat_id):
+            return P2CardActionTriggerResponse({"toast": {"type": "error", "content": "🔒 仅管理员可申请开放平台权限"}})
+        feature = (action_value.get("feature") or "base").strip().lower()
+        if app_state.main_loop and app_state.main_loop.is_running():
+            from commands import _start_app_scope_grant
+
+            async def do_grant():
+                await _start_app_scope_grant(card_message_id, chat_id, feature)
+
+            asyncio.run_coroutine_threadsafe(do_grant(), app_state.main_loop)
+        return P2CardActionTriggerResponse({"toast": {"type": "info", "content": "已发起授权，请查看确认链接"}})
+
     if action_value.get("action") == "switch_model":
         new_model = action_value.get("model")
         
@@ -80,6 +93,7 @@ def do_p2_card_action_trigger(data: P2CardActionTrigger) -> P2CardActionTriggerR
                 old_model = session_data.get("model", "Default")
                 session_data["model"] = new_model
                 session_data["base_model"] = new_model
+                session_data["model_user_override"] = True
                 await save_session_async(chat_id, session_data)
                 log.info(f"Switched model to {new_model} in chat {chat_id}")
                 try:
@@ -114,31 +128,58 @@ def do_p2_card_action_trigger(data: P2CardActionTrigger) -> P2CardActionTriggerR
         choice = action_value.get("choice", "")
         label = action_value.get("label", choice)
         log.info(f"User selected choice: {choice}")
-        
+
         if app_state.main_loop and app_state.main_loop.is_running():
             async def notify_and_process():
-                handled = False
-                if choice and choice.startswith("/"):
-                    session_data = await get_session_async(chat_id)
-                    # 1. 优先使用完整的 choice 执行命令（保留如 "/update confirm" 等子命令参数）
-                    handled_res, _ = await handle_slash_command(choice, card_message_id, chat_id, session_data, running_processes, chat_queues, chat_workers)
-                    handled = bool(handled_res)
-                    if not handled:
-                        # 2. 提取首个命令词（处理带说明括号的选项如 "/light (常用缩写...)" -> "/light"）
-                        clean_cmd = choice.split()[0].strip()
-                        if clean_cmd != choice:
-                            handled_res2, _ = await handle_slash_command(clean_cmd, card_message_id, chat_id, session_data, running_processes, chat_queues, chat_workers)
-                            handled = bool(handled_res2)
+                try:
+                    handled = False
+                    if choice and choice.startswith("/"):
+                        session_data = await get_session_async(chat_id)
+                        # 1. 优先使用完整的 choice 执行命令（保留如 "/update confirm" 等子命令参数）
+                        handled_res, _ = await handle_slash_command(
+                            choice, card_message_id, chat_id, session_data,
+                            running_processes, chat_queues, chat_workers,
+                        )
+                        handled = bool(handled_res)
+                        if not handled:
+                            # 2. 提取首个命令词（处理带说明括号的选项）
+                            clean_cmd = choice.split()[0].strip()
+                            if clean_cmd != choice:
+                                handled_res2, _ = await handle_slash_command(
+                                    clean_cmd, card_message_id, chat_id, session_data,
+                                    running_processes, chat_queues, chat_workers,
+                                )
+                                handled = bool(handled_res2)
 
-                if not handled:
-                    # 2. 如果不是有效斜杠指令或未被命令捕获，统一模拟为用户回复提交给 AI 继续处理
-                    user_display_text = f"✅ **您已选择：{label}**\n*(选项内容已提交 AI 进行下一步处理...)*"
-                    await asyncio.get_running_loop().run_in_executor(None, lambda: send_reply_sdk(card_message_id, user_display_text))
-                    simulated_content = json.dumps({"text": f"我的选择是：{choice}"})
-                    await _handle_message_async_internal(card_message_id, chat_id, "text", simulated_content)
+                    if not handled:
+                        user_display_text = (
+                            f"✅ **您已选择：{label}**\n*(选项内容已提交 AI 进行下一步处理...)*"
+                        )
+                        await asyncio.get_running_loop().run_in_executor(
+                            None, lambda: send_reply_sdk(card_message_id, user_display_text)
+                        )
+                        simulated_content = json.dumps({"text": f"我的选择是：{choice}"})
+                        await _handle_message_async_internal(
+                            card_message_id, chat_id, "text", simulated_content
+                        )
+                except Exception as e:
+                    log.error(f"[card_actions] user_choice processing failed: {e}", exc_info=True)
+                    try:
+                        await asyncio.get_running_loop().run_in_executor(
+                            None,
+                            lambda: send_reply_sdk(
+                                card_message_id, f"⚠️ 处理选项失败：{e}"
+                            ),
+                        )
+                    except Exception:
+                        pass
 
             asyncio.run_coroutine_threadsafe(notify_and_process(), app_state.main_loop)
-            
+
+        return P2CardActionTriggerResponse({
+            "toast": {"type": "info", "content": f"已选择：{label}"}
+        })
+
     elif action_value.get("action") == "l3_confirm_action":
         decision = action_value.get("decision", "reject")
         command = action_value.get("command", "")

@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     )
 
     # Optional default model configuration
-    default_model: str = Field(default="gemini-3.7-flash-low", alias="DEFAULT_MODEL")
+    default_model: str = Field(default="gemini-3.8-flash-low", alias="DEFAULT_MODEL")
 
     # Native voice reply settings
     tts_voice: str = Field(default="zh-CN-XiaoxiaoNeural", alias="TTS_VOICE")
@@ -63,7 +63,7 @@ class Settings(BaseSettings):
 settings = Settings()
 
 APP_ID = settings.feishu_app_id or settings.app_id
-DEFAULT_MODEL = settings.default_model or "gemini-3.7-flash-low"
+DEFAULT_MODEL = settings.default_model or "gemini-3.8-flash-low"
 APP_SECRET = settings.feishu_app_secret or settings.app_secret
 TTS_VOICE = settings.tts_voice or "zh-CN-XiaoxiaoNeural"
 ENABLE_VOICE_REPLY = settings.enable_voice_reply

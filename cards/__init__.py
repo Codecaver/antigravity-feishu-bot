@@ -1,5 +1,5 @@
 """Feishu interactive card builders (split modules)."""
-from cards import common, models, indicators, response, projects, system, memory, stats_cards, auth, cron, plugin, system_one_card
+from cards import common, models, indicators, response, projects, system, memory, stats_cards, auth, cron, plugin, system_one_card, app_scopes
 
 
 class CardBuilder:
@@ -27,7 +27,10 @@ class CardBuilder:
     build_stall_warning_card = staticmethod(indicators.build_stall_warning_card)
     build_stall_error_card = staticmethod(indicators.build_stall_error_card)
 
-    build_ai_response = staticmethod(response.build_ai_response)
+    @staticmethod
+    def build_ai_response(*args, **kwargs):
+        import cards.response as _resp
+        return _resp.build_ai_response(*args, **kwargs)
 
     build_dir_browser_card = staticmethod(projects.build_dir_browser_card)
 
@@ -79,5 +82,9 @@ class CardBuilder:
     build_typesafe_tier_menu_card = build_system_one_tier_menu_card
     build_l3_high_risk_confirm_card = staticmethod(system_one_card.build_l3_high_risk_confirm_card)
     build_l3_confirm_result_card = staticmethod(system_one_card.build_l3_confirm_result_card)
+
+    build_scope_panel_card = staticmethod(app_scopes.build_scope_panel_card)
+    build_scope_grant_link_card = staticmethod(app_scopes.build_scope_grant_link_card)
+    build_scope_grant_result_card = staticmethod(app_scopes.build_scope_grant_result_card)
 
 

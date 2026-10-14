@@ -102,6 +102,44 @@ def send_reply_sdk(message_id, reply_text):
             log.error(f"[send_reply_sdk] Failed: {resp.msg}")
 
 @with_retry(max_retries=1)
+def send_post_reply_sdk(message_id, post_content):
+    req = ReplyMessageRequest.builder() \
+        .message_id(message_id) \
+        .request_body(ReplyMessageRequestBody.builder() \
+            .msg_type("post") \
+            .content(json.dumps(post_content)) \
+            .build()) \
+        .build()
+    resp = api_client.im.v1.message.reply(req)
+    if resp.code != 0:
+        log.error(f"[send_post_reply_sdk] Failed: {resp.msg}")
+        return None
+    try:
+        return json.loads(resp.raw.content).get("data", {}).get("message_id")
+    except:
+        return None
+
+@with_retry(max_retries=1)
+def send_post_to_chat_sdk(chat_id, post_content):
+    from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+    req = CreateMessageRequest.builder() \
+        .receive_id_type("chat_id") \
+        .request_body(CreateMessageRequestBody.builder() \
+            .receive_id(chat_id) \
+            .msg_type("post") \
+            .content(json.dumps(post_content)) \
+            .build()) \
+        .build()
+    resp = api_client.im.v1.message.create(req)
+    if resp.code != 0:
+        log.error(f"[send_post_to_chat_sdk] Failed: {resp.msg}")
+        return None
+    try:
+        return json.loads(resp.raw.content).get("data", {}).get("message_id")
+    except:
+        return None
+
+@with_retry(max_retries=1)
 def send_interactive_card_sdk(message_id, card_content):
     req = ReplyMessageRequest.builder() \
         .message_id(message_id) \

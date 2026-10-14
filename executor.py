@@ -400,47 +400,38 @@ def format_tool_action(tool_name: str = "", params: dict = None, raw_action: str
     return "正在执行操作"
 
 async def _stream_typewriter_to_feishu(bot_reply_msg_id, full_text, user_text, think_seconds, feishu_call_fn, start_index=0, completed_steps_count=0, total_planned_steps=0, is_voice=False):
-    """Fast stream full_text onto Feishu interactive card without artificial delay."""
+    """把尚未流式刷出的尾巴补到卡片上；文本用细粒度增量，避免 1500 字一整批跳变。"""
     if not bot_reply_msg_id or not full_text:
         return
-        
+
     total_len = len(full_text)
     if start_index >= total_len:
         return
-        
+
     remaining = total_len - start_index
-    if not is_voice:
-        # 文本模式：若剩余字符较少或已完整生成，直接一次性 patch 完成以保证极速响应
-        if remaining <= 1500:
-            card = CardBuilder.build_streaming_indicator(
-                full_text, tool_action=None, user_text=user_text, think_seconds=think_seconds,
-                completed_steps_count=completed_steps_count, total_planned_steps=total_planned_steps
-            )
-            await feishu_call_fn(
-                lambda: patch_interactive_card_sdk(bot_reply_msg_id, card),
-                label="typewriter patch fast"
-            )
-            return
-        
-    chunk_size = 28 if is_voice else 1500
+    # 流式阶段已基本刷完：留给最终卡即可，不再二次批刷
+    if not is_voice and remaining <= 64:
+        return
+
+    chunk_size = 28 if is_voice else 72
     current_len = start_index
     while current_len < total_len:
         current_len += chunk_size
         if current_len > total_len:
             current_len = total_len
-            
+
         typed_part = full_text[:current_len]
         card = CardBuilder.build_streaming_indicator(
             typed_part, tool_action=None, user_text=user_text, think_seconds=think_seconds,
             completed_steps_count=completed_steps_count, total_planned_steps=total_planned_steps
         )
-        
+
         await feishu_call_fn(
-            lambda: patch_interactive_card_sdk(bot_reply_msg_id, card),
+            lambda c=card: patch_interactive_card_sdk(bot_reply_msg_id, c),
             label="typewriter patch"
         )
-        if is_voice and current_len < total_len:
-            await asyncio.sleep(0.12)
+        if current_len < total_len:
+            await asyncio.sleep(0.035 if is_voice else 0.028)
 
 
 def parse_transcript_turn(transcript_path, initial_size=0):
@@ -618,6 +609,92 @@ def extract_final_chinese_response(text):
     text = re.sub(r'^\s*\[TASK_PLAN\][^\n]*(?:\n|$)', '', text, flags=re.IGNORECASE).strip()
 
     return text
+
+
+def extract_thinking_content(text: str) -> str:
+    """从模型原文中抽出思考/推理片段（供最终卡片折叠面板保留）。"""
+    if not text:
+        return ""
+    chunks = []
+    # 注意：标签名必须按长到短匹配，避免 <thinking> 被 <think 吃掉
+    tag_pat = re.compile(
+        r"<(thinking|thought|think)>\s*(.*?)\s*</\1>",
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    for m in tag_pat.finditer(text):
+        piece = (m.group(2) or "").strip()
+        if piece and piece not in chunks:
+            chunks.append(piece)
+    # 仅匹配行首标题，避免误伤 </thinking> 里的单词
+    head_pat = re.compile(
+        r"^(?:\*\*|#{1,3}\s*)?(?:Thinking Process|Thought|Thinking|Reasoning|思考过程|推理过程)(?:\*\*|：|:)\s*(.+?)(?=\n\n|\Z)",
+        flags=re.DOTALL | re.IGNORECASE | re.MULTILINE,
+    )
+    for m in head_pat.finditer(text):
+        piece = (m.group(1) or "").strip()
+        if piece and piece not in chunks:
+            chunks.append(piece)
+    return "\n\n".join(chunks).strip()
+
+
+def build_process_narrative(planned_steps=None, completed_steps=None) -> str:
+    """把任务规划/已执行工具整理成可读过程（对齐 bridge 的过程可见性）。"""
+    from cards.indicators import clean_action_text
+
+    planned_steps = planned_steps or []
+    completed_steps = completed_steps or []
+    lines = []
+    if planned_steps:
+        for i, step in enumerate(planned_steps):
+            done = i < len(completed_steps)
+            mark = "✅" if done else "⏳"
+            lines.append(f"{i + 1}. {mark} {step}")
+        # 额外完成的工具（超出规划）
+        if len(completed_steps) > len(planned_steps):
+            for step in completed_steps[len(planned_steps) :]:
+                tip = clean_action_text(step) or step
+                lines.append(f"- ✅ {tip}")
+    else:
+        for i, step in enumerate(completed_steps, 1):
+            tip = clean_action_text(step) or step
+            lines.append(f"{i}. ✅ {tip}")
+    return "\n".join(lines).strip()
+
+
+def compose_reasoning_panel_body(raw_text: str, planned_steps=None, completed_steps=None, max_chars: int = 6000) -> str:
+    """合并思考原文 + 执行过程，供最终卡片保留。"""
+    thinking = extract_thinking_content(raw_text or "")
+    process = build_process_narrative(planned_steps, completed_steps)
+    # 无标签思考时：用最终答复之前的前言作为软思考（去掉 TASK_PLAN / 标签残留）
+    if not thinking and raw_text:
+        answer = extract_final_chinese_response(raw_text)
+        preamble = raw_text
+        if answer:
+            idx = raw_text.find(answer[: min(48, len(answer))])
+            if idx > 20:
+                preamble = raw_text[:idx]
+        preamble = re.sub(
+            r"<(thinking|thought|think)>.*?</\1>",
+            "",
+            preamble,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        preamble = re.sub(r"\[TASK_PLAN\].*?\[/TASK_PLAN\]\s*", "", preamble, flags=re.DOTALL | re.IGNORECASE)
+        preamble = re.sub(r"^\s*\[TASK_PLAN\][^\n]*(?:\n|$)", "", preamble, flags=re.IGNORECASE)
+        preamble = preamble.strip()
+        if len(preamble) >= 24 and preamble != (answer or "").strip():
+            thinking = preamble
+
+    parts = []
+    if thinking:
+        parts.append(thinking)
+    if process:
+        parts.append("**执行过程**\n" + process)
+    body = "\n\n".join(parts).strip()
+    if len(body) > max_chars:
+        body = body[: max_chars - 20] + "\n\n_(思考内容过长已截断)_"
+    return body
+
 
 def extract_choice_card_data(reply_text, transcript_path=None, initial_transcript_size=0):
     """
@@ -917,8 +994,73 @@ async def execute_antigravity(
                             pass
                 else:
                     log.warning(f"[Executor] Initial typing card send failed for chat {chat_id}; will fall back to sending final card as new message")
-            
+
+            # CardKit 原生流式：优先续用 pipeline 已发出的占位卡，禁止再发一张后删除旧卡（飞书会显示「撤回」）
+            cardkit_stream = None
+            _pending_cardkit_text = None
+            _cardkit_push_task = None
+            if not is_voice_message:
+                try:
+                    from lark_stream import StreamingMarkdownCard
+
+                    existing_ck = (task_meta or {}).get("cardkit_card_id") if task_meta else None
+                    existing_msg = bot_reply_msg_id or ((task_meta or {}).get("bot_reply_msg_id") if task_meta else None)
+                    existing_seq = int((task_meta or {}).get("cardkit_sequence") or 0) if task_meta else 0
+                    if existing_ck and existing_msg:
+                        cardkit_stream = StreamingMarkdownCard.attach(
+                            existing_ck, existing_msg, sequence=existing_seq
+                        )
+                        bot_reply_msg_id = existing_msg
+                        log.info(f"[Executor] Reusing CardKit placeholder card_id={existing_ck}")
+                    elif message_id and str(message_id).startswith("om_"):
+                        started = await _feishu_call(
+                            lambda: StreamingMarkdownCard.start_as_reply(message_id, "…"),
+                            timeout=12.0,
+                            label="cardkit start",
+                        )
+                        if started and getattr(started, "card_id", None):
+                            cardkit_stream = started
+                            bot_reply_msg_id = cardkit_stream.message_id
+                            if task_meta is not None:
+                                task_meta["bot_reply_msg_id"] = bot_reply_msg_id
+                                task_meta["cardkit_card_id"] = cardkit_stream.card_id
+                                task_meta["cardkit_sequence"] = cardkit_stream.sequence
+                except Exception as e:
+                    log.warning(f"[Executor] CardKit stream unavailable, legacy patch mode: {e}")
+
+            async def _flush_cardkit_pushes():
+                nonlocal _cardkit_push_task
+                if _cardkit_push_task is not None:
+                    try:
+                        await _cardkit_push_task
+                    except Exception:
+                        pass
+                    _cardkit_push_task = None
+
+            def _schedule_cardkit_content(text: str):
+                """非阻塞推送 CardKit 正文（latest-wins）。"""
+                nonlocal _pending_cardkit_text, _cardkit_push_task
+                if not cardkit_stream or cardkit_stream.failed:
+                    return
+                _pending_cardkit_text = text
+                if _cardkit_push_task is not None and not _cardkit_push_task.done():
+                    return
+
+                async def _runner():
+                    nonlocal _pending_cardkit_text
+                    while _pending_cardkit_text is not None and cardkit_stream and not cardkit_stream.failed:
+                        payload = _pending_cardkit_text
+                        _pending_cardkit_text = None
+                        await _feishu_call(
+                            lambda t=payload: cardkit_stream.set_content(t),
+                            timeout=8.0,
+                            label="cardkit content",
+                        )
+
+                _cardkit_push_task = asyncio.create_task(_runner())
+
             accumulated_text = ""
+            accumulated_thinking = ""
             stderr_text = ""
             stream_result_response = None
             stream_error_msg = ""
@@ -948,7 +1090,7 @@ async def execute_antigravity(
                 return None
 
             last_streamed_length = 0
-            last_patch_time = time.time()
+            last_patch_time = 0.0
             process_start_time = time.time()
             last_progress_time = process_start_time
             last_cpu_check_time = 0
@@ -964,7 +1106,55 @@ async def execute_antigravity(
             typesafe_blocked_info = None
             evaluated_tool_calls = set()
             last_patched_card_sig = ""
-            
+            # 对齐 bridge：流式刷卡 latest-wins，不阻塞读 agent 事件
+            _pending_stream_card = None
+            _stream_patch_task = None
+            STREAM_PATCH_MIN_INTERVAL = 0.05
+
+            async def _flush_stream_patches():
+                nonlocal _stream_patch_task
+                if _stream_patch_task is not None:
+                    try:
+                        await _stream_patch_task
+                    except Exception:
+                        pass
+                    _stream_patch_task = None
+
+            def _schedule_stream_card(card):
+                """合并待发送卡片；有进行中的 patch 时只更新 pending，避免主循环被飞书 API 拖成一批一批。"""
+                nonlocal _pending_stream_card, _stream_patch_task, last_patch_time, last_patched_card_sig
+                if not bot_reply_msg_id or not card:
+                    return
+                card_sig = str(card.get("elements", []))
+                if card_sig == last_patched_card_sig and _pending_stream_card is None:
+                    return
+                _pending_stream_card = card
+                if _stream_patch_task is not None and not _stream_patch_task.done():
+                    return
+
+                async def _runner():
+                    nonlocal _pending_stream_card, last_patch_time, last_patched_card_sig
+                    while _pending_stream_card is not None:
+                        wait = STREAM_PATCH_MIN_INTERVAL - (time.time() - last_patch_time)
+                        if wait > 0:
+                            await asyncio.sleep(wait)
+                        card_to_send = _pending_stream_card
+                        _pending_stream_card = None
+                        if not bot_reply_msg_id or not card_to_send:
+                            continue
+                        sig = str(card_to_send.get("elements", []))
+                        if sig == last_patched_card_sig:
+                            continue
+                        last_patch_time = time.time()
+                        last_patched_card_sig = sig
+                        await _feishu_call(
+                            lambda c=card_to_send: patch_interactive_card_sdk(bot_reply_msg_id, c),
+                            timeout=8.0,
+                            label="indicator patch"
+                        )
+
+                _stream_patch_task = asyncio.create_task(_runner())
+
             # 从配置中读取超时配置，支持自定义配置并设置合理防御值
             BASE_STALL_TIMEOUT = getattr(config, "STALL_TIMEOUT", 600)
             BASE_STALL_HARD_TIMEOUT = getattr(config, "STALL_HARD_TIMEOUT", 3600)
@@ -975,7 +1165,7 @@ async def execute_antigravity(
             turn_stream = await sess.send_prompt_and_stream(system_instruction + final_prompt)
 
             while True:
-                event_data = await turn_stream.get_event(timeout=0.2)
+                event_data = await turn_stream.get_event(timeout=0.08)
                 now = time.time()
 
                 events_to_process = [event_data] if event_data else []
@@ -1005,7 +1195,16 @@ async def execute_antigravity(
                     elif event_type == "step_update":
                         step_up = ev.get("step_update", {})
                         step_t = step_up.get("step_type")
-                        if step_t == "agent_response":
+                        if step_t in ("thought", "thinking", "reasoning"):
+                            tdelta = (
+                                step_up.get("text_delta")
+                                or step_up.get("text")
+                                or step_up.get("thought")
+                                or ""
+                            )
+                            if tdelta:
+                                accumulated_thinking += tdelta
+                        elif step_t == "agent_response":
                             delta = step_up.get("text_delta")
                             if delta:
                                 accumulated_text += delta
@@ -1177,6 +1376,8 @@ async def execute_antigravity(
                             )
                         stderr_text = f"⚠️ 任务已检测到假死并自动终止（连续 {stall_seconds // 60} 分钟没有任何输出、进程树无任何 CPU 活跃且无任何工具在运行）。"
                         session_data["last_execution_error"] = True
+                        await _flush_cardkit_pushes()
+                        await _flush_stream_patches()
                         return {"has_reply": True, "reply_text": stderr_text, "is_error": True}
 
                 if think_seconds > 43200:
@@ -1184,6 +1385,8 @@ async def execute_antigravity(
                     await sess.close()
                     stderr_text = "⚠️ 执行超时 (12小时)：后台超大型任务已达到系统设定的 12 小时最高保护上限。"
                     session_data["last_execution_error"] = True
+                    await _flush_cardkit_pushes()
+                    await _flush_stream_patches()
                     return {"has_reply": True, "reply_text": stderr_text, "is_error": True}
 
                 has_active_tool = bool(current_tool_action or stream_action or last_tool_action or completed_tool_steps or has_tool_in_flight)
@@ -1200,53 +1403,75 @@ async def execute_antigravity(
                         clean_partial = cp.strip()
 
                 has_tool_in_flight = bool(current_tool_action or stream_action)
-                is_complex = bool(planned_steps or completed_tool_steps)
 
-                # 判定是否切换到打字机文本流式输出：
-                # 1. 如果工具正在执行中，绝对不切换，保持显示规划步骤/工具进度卡片；
-                # 2. 如果是纯问答无工具任务，只要有文本输出立即打字机流式呈现；
-                # 3. 如果是多步骤复杂任务，仅在所有工具执行完毕、且模型输出实质性总结文本（>=25字）时才切换至打字机
+                # 流式策略（对齐 lark-agent-bridge / Cursor）：
+                # 一旦有可展示的 assistant 文本就原地 patch 打字机卡片；
+                # 工具执行期间也继续刷正文（工具名挂在状态栏），避免「整段攒完再一批发出」。
                 is_streaming_text = False
                 guard_before_delivery = (
                     config.TYPESAFE_ENABLED
                     and config.TYPESAFE_TIER in ("sentry", "copilot")
                 )
-                if clean_partial and not has_tool_in_flight:
+                if clean_partial and len(clean_partial) >= 1:
                     if is_voice_message:
-                        # 语音对话模式：流式生成期间不提前打字剧透，优先保证语音消息首先送达
+                        # 语音对话：流式阶段不剧透文字，优先语音送达
                         is_streaming_text = False
                     elif guard_before_delivery:
-                        # Do not expose unreviewed text; final output is checked before delivery.
+                        # sentry/copilot：终审前不暴露未审核正文
                         is_streaming_text = False
-                    elif not is_complex:
-                        is_streaming_text = True
                     else:
-                        min_chars = 15 if (planned_steps and current_plan_idx >= len(planned_steps) - 1) else 25
-                        if len(clean_partial) >= min_chars:
-                            if planned_steps:
-                                current_plan_idx = len(planned_steps) - 1
-                            is_streaming_text = True
+                        is_streaming_text = True
 
-                desired_patch_interval = 0.20
                 if is_streaming_text:
                     display_partial = clean_partial
                     last_streamed_length = len(clean_partial)
-                    indicator_card = CardBuilder.build_streaming_indicator(
-                        display_partial,
-                        None,
-                        user_text,
-                        think_seconds,
-                        completed_steps_count=len(completed_tool_steps),
-                        total_planned_steps=len(planned_steps) if planned_steps else 0
-                    )
-                    desired_patch_interval = 0.20
+                    active_action = current_tool_action or stream_action or ""
+                    if cardkit_stream and not cardkit_stream.failed:
+                        # 工具进行中时在正文顶部挂一行轻量状态
+                        if active_action:
+                            from cards.indicators import clean_action_text
+                            tip = clean_action_text(active_action)
+                            stream_body = f"*🛠️ {tip}*\n\n{display_partial}" if tip else display_partial
+                        else:
+                            stream_body = display_partial
+                        _schedule_cardkit_content(stream_body)
+                    else:
+                        indicator_card = CardBuilder.build_streaming_indicator(
+                            display_partial,
+                            active_action or None,
+                            user_text,
+                            think_seconds,
+                            completed_steps_count=len(completed_tool_steps),
+                            total_planned_steps=len(planned_steps) if planned_steps else 0
+                        )
+                        _schedule_stream_card(indicator_card)
                 elif stall_seconds >= effective_warning_threshold and not is_worker_active and not has_tool_in_flight:
-                    indicator_card = CardBuilder.build_stall_warning_card(user_text, think_seconds, stall_seconds)
-                    desired_patch_interval = 2.0
+                    if cardkit_stream and not cardkit_stream.failed:
+                        _schedule_cardkit_content(
+                            f"**⏱️ AI 深度推理中**\n\n"
+                            f"已连续等待约 **{stall_seconds}s**（总耗时 {think_seconds}s）。\n\n"
+                            f"_模型仍在推理或调度工具，请稍候…_"
+                        )
+                    else:
+                        indicator_card = CardBuilder.build_stall_warning_card(user_text, think_seconds, stall_seconds)
+                        _schedule_stream_card(indicator_card)
                 else:
                     active_action = current_tool_action or stream_action
                     display_action = active_action or (last_tool_action if not planned_steps else "")
-                    if display_action or completed_tool_steps or planned_steps:
+                    if cardkit_stream and not cardkit_stream.failed:
+                        # CardKit 同一条消息上刷新思考/工具进度（勿再 patch 旧 interactive JSON）
+                        from cards.indicators import build_cardkit_progress_markdown
+                        _schedule_cardkit_content(
+                            build_cardkit_progress_markdown(
+                                user_text=user_text,
+                                think_seconds=think_seconds,
+                                tool_action=display_action or None,
+                                completed_steps=completed_tool_steps,
+                                planned_steps=planned_steps,
+                                is_voice=is_voice_message,
+                            )
+                        )
+                    elif display_action or completed_tool_steps or planned_steps:
                         indicator_card = CardBuilder.build_tool_indicator(
                             display_action,
                             user_text,
@@ -1258,21 +1483,14 @@ async def execute_antigravity(
                             current_step_idx=current_plan_idx,
                             process_status=process_status_info
                         )
+                        _schedule_stream_card(indicator_card)
                     else:
                         indicator_card = CardBuilder.build_typing_indicator(
                             downloaded_file_name, download_success, user_text, think_seconds, is_voice=is_voice_message
                         )
-                    desired_patch_interval = 0.25
-
-                card_sig = str(indicator_card.get("elements", []))
-                if (card_sig != last_patched_card_sig) and (time.time() - last_patch_time >= desired_patch_interval):
-                    last_patch_time = time.time()
-                    last_patched_card_sig = card_sig
-                    if bot_reply_msg_id:
-                        await _feishu_call(
-                            lambda: patch_interactive_card_sdk(bot_reply_msg_id, indicator_card),
-                            label="indicator patch"
-                        )
+                        _schedule_stream_card(indicator_card)
+            await _flush_cardkit_pushes()
+            await _flush_stream_patches()
             await turn_stream.aclose()
 
             if hasattr(sess, "get_recent_stderr"):
@@ -1480,8 +1698,8 @@ async def execute_antigravity(
                 except Exception as e:
                     log.error(f"[Executor] Prioritized voice reply failed or timed out: {e}")
 
-            # 2. 语音消息已送达，紧接着让卡片启动打字机效果呈现完整文字
-            if not is_error and bot_reply_msg_id and reply_text:
+            # 2. 非 CardKit：补打字机尾巴；CardKit 由原生 typewriter 负责
+            if not is_error and bot_reply_msg_id and reply_text and not (cardkit_stream and not cardkit_stream.failed):
                 try:
                     safe_start_index = 0 if is_voice_message else min(last_streamed_length, len(reply_text))
                     await _stream_typewriter_to_feishu(
@@ -1536,40 +1754,118 @@ async def execute_antigravity(
                 except Exception as e:
                     log.warning(f"[Executor] Failed to persist last_ai_summary: {e}")
 
-            final_card = CardBuilder.build_ai_response(
-                reply_text, 
-                choice_card_data=choice_card_data,
-                current_model=session_data.get('model', 'Default'),
-                current_project=session_data.get('project', '默认'),
-                is_error=is_error,
-                is_streaming=False,
-                session_data=session_data,
-                is_quota=is_quota_exhausted
-            )
-            if bot_reply_msg_id:
-                patch_ok = await _feishu_call(
-                    lambda: patch_interactive_card_sdk(bot_reply_msg_id, final_card),
-                    label="final-card patch"
+            # 飞书排版清洗（去掉 file:// 等）+ 保留思考/过程供最终卡片展示
+            reasoning_text = ""
+            try:
+                from utils.feishu_markdown import sanitize_feishu_markdown
+                raw_for_reason = accumulated_text or reply_text or ""
+                if accumulated_thinking.strip():
+                    raw_for_reason = (
+                        f"<thinking>\n{accumulated_thinking.strip()}\n</thinking>\n\n{raw_for_reason}"
+                    )
+                reasoning_text = compose_reasoning_panel_body(
+                    raw_for_reason,
+                    planned_steps=planned_steps,
+                    completed_steps=completed_tool_steps,
                 )
-                if patch_ok is None:
-                    from lark_client import send_reply_sdk
-                    fallback_text = reply_text[:2000] if reply_text else "(AI 回复卡片发送失败，请查看工作区获取完整内容)"
-                    await _feishu_call(
-                        lambda: send_reply_sdk(message_id, fallback_text),
-                        label="final-card text fallback"
+                if reasoning_text:
+                    reasoning_text = sanitize_feishu_markdown(reasoning_text)
+                if reply_text:
+                    reply_text = sanitize_feishu_markdown(reply_text)
+            except Exception as e:
+                log.warning(f"[Executor] reasoning compose failed: {e}")
+
+            # CardKit 终态：整卡替换，保留可折叠思考面板（对齐 bridge）
+            delivered_via_cardkit = False
+            if cardkit_stream and not cardkit_stream.failed and not is_voice_message:
+                try:
+                    await _flush_cardkit_pushes()
+                    from lark_stream import build_final_markdown_card_json
+                    extra = []
+                    if choice_card_data and choice_card_data.get("options"):
+                        opts = "\n".join(
+                            f"{i}. {o}" for i, o in enumerate(choice_card_data["options"][:10], 1)
+                        )
+                        q = choice_card_data.get("question") or "请选择"
+                        extra.append({"tag": "hr"})
+                        extra.append({
+                            "tag": "markdown",
+                            "content": f"**{q}**\n\n{opts}\n\n_(点击下方按钮或直接回复选项)_",
+                        })
+                        btns = []
+                        for opt in choice_card_data["options"][:6]:
+                            label = (opt[:20] + "…") if len(opt) > 20 else opt
+                            btns.append({
+                                "tag": "button",
+                                "text": {"tag": "plain_text", "content": label},
+                                "type": "default",
+                                "behaviors": [{
+                                    "type": "callback",
+                                    "value": {
+                                        "action": "user_choice",
+                                        "choice": opt,
+                                        "label": label,
+                                    },
+                                }],
+                            })
+                        if btns:
+                            extra.append({"tag": "action", "actions": btns})
+                    final_json = build_final_markdown_card_json(
+                        reply_text or "_(空回复)_",
+                        elements_extra=extra or None,
+                        reasoning_text=None if is_error else reasoning_text,
                     )
-            else:
-                if message_id and str(message_id).startswith("om_"):
-                    await _feishu_call(
-                        lambda: send_interactive_card_sdk(message_id, final_card),
-                        label="final-card send"
+                    ok = await _feishu_call(
+                        lambda: cardkit_stream.replace_with_card(final_json),
+                        timeout=12.0,
+                        label="cardkit final replace",
                     )
+                    delivered_via_cardkit = bool(ok)
+                except Exception as e:
+                    log.warning(f"[Executor] CardKit final delivery failed: {e}")
+
+            if not delivered_via_cardkit:
+                try:
+                    import importlib
+                    import cards.response as _resp_mod
+                    importlib.reload(_resp_mod)
+                except Exception:
+                    pass
+                final_card = CardBuilder.build_ai_response(
+                    reply_text,
+                    choice_card_data=choice_card_data,
+                    current_model=session_data.get('model', 'Default'),
+                    current_project=session_data.get('project', '默认'),
+                    is_error=is_error,
+                    is_streaming=False,
+                    session_data=session_data,
+                    is_quota=is_quota_exhausted,
+                    reasoning_text=None if is_error else reasoning_text,
+                )
+                if bot_reply_msg_id:
+                    patch_ok = await _feishu_call(
+                        lambda: patch_interactive_card_sdk(bot_reply_msg_id, final_card),
+                        label="final-card patch"
+                    )
+                    if patch_ok is None:
+                        from lark_client import send_reply_sdk
+                        fallback_text = reply_text[:2000] if reply_text else "(AI 回复卡片发送失败，请查看工作区获取完整内容)"
+                        await _feishu_call(
+                            lambda: send_reply_sdk(message_id, fallback_text),
+                            label="final-card text fallback"
+                        )
                 else:
-                    from lark_client import send_card_to_chat_sdk
-                    await _feishu_call(
-                        lambda: send_card_to_chat_sdk(chat_id, final_card),
-                        label="final-card send to chat"
-                    )
+                    if message_id and str(message_id).startswith("om_"):
+                        await _feishu_call(
+                            lambda: send_interactive_card_sdk(message_id, final_card),
+                            label="final-card send"
+                        )
+                    else:
+                        from lark_client import send_card_to_chat_sdk
+                        await _feishu_call(
+                            lambda: send_card_to_chat_sdk(chat_id, final_card),
+                            label="final-card send to chat"
+                        )
 
             return {"has_reply": bool(final_reply), "returncode": process.returncode, "is_error": is_error, "is_quota_error": is_quota_exhausted}
 
