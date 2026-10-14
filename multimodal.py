@@ -121,19 +121,32 @@ def extract_and_upload_resources(text, message_id, api_client, additional_safe_d
         '.go', '.rs', '.pbxproj', '.xcworkspacedata', '.plist'
     }
 
-    # Also scan inside artifact .md files for images
+    # 仅扫描「交付目录」内的 .md，避免把普通文档里的配图全部甩进会话
     for _, file_path in raw_files:
-        if file_path.endswith(".md") and os.path.exists(file_path):
-            try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    md_content = f.read()
-                    imgs = [
-                        img for img in re.findall(r'!\[.*?\]\((?:file://)?([^)]+)\)', md_content)
-                        if not img.startswith(('http://', 'https://'))
-                    ]
-                    images.extend(imgs)
-            except Exception as e:
-                log.error(f"[Multimodal] Error scanning md file: {e}")
+        if not file_path.endswith(".md") or not os.path.exists(file_path):
+            continue
+        abs_md = os.path.abspath(file_path)
+        in_delivery_dir = any(
+            abs_md == os.path.abspath(p) or abs_md.startswith(os.path.abspath(p) + os.sep)
+            for p in (
+                os.path.join(workspace_dir, "downloads"),
+                os.path.join(workspace_dir, "scratch"),
+                tmp_dir,
+                "/tmp",
+            )
+        )
+        if not in_delivery_dir:
+            continue
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                md_content = f.read()
+                imgs = [
+                    img for img in re.findall(r'!\[.*?\]\((?:file://)?([^)]+)\)', md_content)
+                    if not img.startswith(('http://', 'https://'))
+                ]
+                images.extend(imgs)
+        except Exception as e:
+            log.error(f"[Multimodal] Error scanning md file: {e}")
 
     def _send_image(img_path: str) -> bool:
         from lark_client import mark_image_sent, was_image_recently_sent
@@ -187,13 +200,14 @@ def extract_and_upload_resources(text, message_id, api_client, additional_safe_d
     # 2. Upload Files / Audio
     uploaded_files = set()
     for label, file_path in raw_files:
-        if file_path in uploaded_files:
-            continue
         if not is_safe_path(file_path):
             log.warning(f"[Multimodal] Blocked unsafe file upload path: {file_path}")
             continue
 
         abs_file = os.path.abspath(file_path)
+        if abs_file in uploaded_files:
+            continue
+        uploaded_files.add(abs_file)
         _, ext = os.path.splitext(abs_file)
         ext_lower = ext.lower()
 
@@ -258,7 +272,6 @@ def extract_and_upload_resources(text, message_id, api_client, additional_safe_d
 
         if os.path.exists(abs_file):
             try:
-                uploaded_files.add(file_path)
                 duration_ms = None
                 is_opus_voice = (ext_lower == ".opus")
                 if is_opus_voice:

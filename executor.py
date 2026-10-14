@@ -10,7 +10,6 @@ import config
 from logger import log
 from card_builder import CardBuilder
 from lark_client import patch_interactive_card_sdk, send_interactive_card_sdk, api_client
-from multimodal import extract_and_upload_resources
 from database import save_session_async
 import stats
 import app_state
@@ -1687,25 +1686,6 @@ async def execute_antigravity(
                 except Exception as e:
                     log.error(f"Failed to extract generated images from transcript: {e}")
             
-            if not is_quota_exhausted and reply_text:
-                active_project = session_data.get("project")
-                ws_root = session_data.get("workspace_root")
-                allowed_dirs = [active_project, ws_root]
-                
-                from bridge_core.media_out import deliver_outbound_media
-                cleaned = await _feishu_call(
-                    lambda: deliver_outbound_media(reply_text, message_id, api_client, allowed_dirs, chat_id=chat_id),
-                    timeout=120.0,
-                    label="deliver_outbound_media"
-                )
-                # Bridge-like: keep prose on the card; media already sent as native msgs
-                if isinstance(cleaned, str) and cleaned.strip():
-                    reply_text = cleaned                
-                if os.path.exists(log_file_path):
-                    await _sync_conversation_id_from_log(log_file_path)
-                
-                is_error = False
-
             if not reply_text:
                 if not quota_err_reply:
                     quota_err_reply = await detect_and_format_quota_error(combined_err_text, model=session_data.get("model", ""))
@@ -1718,6 +1698,7 @@ async def execute_antigravity(
             elif is_quota_exhausted:
                 is_error = True
             else:
+                is_error = False
                 approx_tokens = len(user_text) + len(reply_text)
                 if transcript_path and os.path.exists(transcript_path):
                     try:
@@ -1749,7 +1730,8 @@ async def execute_antigravity(
                     task_meta.get("is_voice_message")
                 )
             )
-            # Sentry / Co-Pilot 必须在文字和语音发出前检查最终回复。
+            # Sentry / Co-Pilot 必须在文字、语音、附件发出前检查最终回复。
+            output_blocked = bool(typesafe_blocked_info)
             if reply_text and not typesafe_blocked_info:
                 if config.TYPESAFE_ENABLED and config.TYPESAFE_TIER in ("sentry", "copilot"):
                     try:
@@ -1763,12 +1745,28 @@ async def execute_antigravity(
                                 "🛡️ **[System One 内容安全拦截]**\n\n"
                                 f"系统检测到回复存在风险或检查服务不可用：{guard_res.reason}。"
                             )
+                            output_blocked = True
                     except Exception as e:
                         log.warning(f"[TypeSafe Sentry] Egress guard failed before delivery: {e}")
                         reply_text = "🛡️ 回复安全检查未能完成，本次内容已暂缓发送。"
+                        output_blocked = True
+
+            # 附件投递放在安全门之后，避免拦截文案前文件已发出；与 send_to_feishu 共用去重
+            if not is_error and not output_blocked and not is_quota_exhausted and reply_text:
+                active_project = session_data.get("project")
+                ws_root = session_data.get("workspace_root")
+                allowed_dirs = [active_project, ws_root]
+                from bridge_core.media_out import deliver_outbound_media
+                cleaned = await _feishu_call(
+                    lambda: deliver_outbound_media(reply_text, message_id, api_client, allowed_dirs, chat_id=chat_id),
+                    timeout=120.0,
+                    label="deliver_outbound_media",
+                )
+                if isinstance(cleaned, str) and cleaned.strip():
+                    reply_text = cleaned
 
             # 1. 优先生成并发送原生语音消息，确保语音条率先送达聊天窗口！
-            if is_voice_message and not is_error and reply_text:
+            if is_voice_message and not is_error and not output_blocked and reply_text:
                 try:
                     from voice_service import send_native_voice_reply
                     log.info("[Executor] Voice reply prioritized: generating and delivering audio message first...")
