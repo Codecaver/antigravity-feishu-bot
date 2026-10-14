@@ -92,8 +92,16 @@ def _get_process_tree_status(root_pid: int) -> dict:
             "sleeping_count": 0, "deadlock_suspect": False
         }
     try:
+        # Darwin 的 ps 不支持 wchan:20，整列失败会导致进程树检测全盘降级
+        import sys
+        if sys.platform == "darwin":
+            ps_fmt = "pid,ppid,state,comm,cputime,args"
+            has_wchan = False
+        else:
+            ps_fmt = "pid,ppid,state,wchan:20,comm,cputime,args"
+            has_wchan = True
         out = subprocess.check_output(
-            ["ps", "-eo", "pid,ppid,state,wchan:20,comm,cputime,args"],
+            ["ps", "-eo", ps_fmt],
             text=True, timeout=3
         ).strip()
         
@@ -101,16 +109,25 @@ def _get_process_tree_status(root_pid: int) -> dict:
         proc_info_map = {}
         
         for line in out.splitlines()[1:]:
-            parts = line.split(None, 6)
-            if len(parts) >= 6:
+            # darwin: pid ppid state comm cputime args
+            # linux:  pid ppid state wchan comm cputime args
+            parts = line.split(None, 5 if not has_wchan else 6)
+            need = 5 if not has_wchan else 6
+            if len(parts) >= need:
                 try:
                     p = int(parts[0])
                     pp = int(parts[1])
                     state = parts[2]
-                    wchan = parts[3]
-                    c = parts[4]
-                    t = _parse_cputime(parts[5])
-                    raw_args = parts[6] if len(parts) > 6 else c
+                    if has_wchan:
+                        wchan = parts[3]
+                        c = parts[4]
+                        t = _parse_cputime(parts[5])
+                        raw_args = parts[6] if len(parts) > 6 else c
+                    else:
+                        wchan = "-"
+                        c = parts[3]
+                        t = _parse_cputime(parts[4])
+                        raw_args = parts[5] if len(parts) > 5 else c
                     children_map.setdefault(pp, []).append(p)
                     proc_info_map[p] = {
                         "pid": p, "ppid": pp, "state": state, "wchan": wchan,
@@ -967,11 +984,26 @@ async def execute_antigravity(
                     existing_msg = bot_reply_msg_id or ((task_meta or {}).get("bot_reply_msg_id") if task_meta else None)
                     existing_seq = int((task_meta or {}).get("cardkit_sequence") or 0) if task_meta else 0
                     existing_run = (task_meta or {}).get("run_id") if task_meta else None
-                    if existing and existing.message_id and (not existing_msg or existing.message_id == existing_msg):
+                    # 仅复用「同一 run_id + 仍在 running」的会话，避免跨轮串台
+                    same_run = (
+                        existing
+                        and existing.message_id
+                        and (not existing_msg or existing.message_id == existing_msg)
+                        and (not existing_run or existing.run_id == existing_run)
+                        and (existing.state or {}).get("terminal") == "running"
+                        and not getattr(existing, "stop_requested", False)
+                    )
+                    if same_run:
                         run_session = existing
                         bot_reply_msg_id = run_session.message_id
                         cardkit_stream = run_session.card
                         log.info(f"[Executor] Reusing active RunSession run_id={run_session.run_id}")
+                    elif existing and not same_run:
+                        try:
+                            from bridge_core.run_session import unregister_active_run
+                            unregister_active_run(chat_id, getattr(existing, "run_id", None))
+                        except Exception:
+                            pass
                     elif existing_ck and existing_msg:
                         run_session = RunSession.attach(
                             chat_id,
@@ -1750,6 +1782,19 @@ async def execute_antigravity(
                         log.warning(f"[TypeSafe Sentry] Egress guard failed before delivery: {e}")
                         reply_text = "🛡️ 回复安全检查未能完成，本次内容已暂缓发送。"
                         output_blocked = True
+
+            # 用户已点停止：不再投递附件/语音/正文，只收口卡片
+            stop_requested = bool(
+                run_session
+                and (
+                    getattr(run_session, "stop_requested", False)
+                    or (run_session.state or {}).get("terminal") == "interrupted"
+                )
+            )
+            if stop_requested:
+                reply_text = ""
+                output_blocked = True
+                is_error = False
 
             # 附件投递放在安全门之后，避免拦截文案前文件已发出；与 send_to_feishu 共用去重
             if not is_error and not output_blocked and not is_quota_exhausted and reply_text:

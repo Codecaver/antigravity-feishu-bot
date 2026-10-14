@@ -384,14 +384,41 @@ async def _process_single_task(chat_id, task):
 
     session_data["bot_reply_msg_id"] = bot_reply_msg_id
 
+    async def _finalize_early_card(card_json_or_v1: dict, *, as_v2_markdown: str = "") -> None:
+        """早起若是 CardKit V2，禁止 message.patch(V1)；改为 card.update 或新发。"""
+        ck_id = task.get("cardkit_card_id")
+        if ck_id and bot_reply_msg_id:
+            try:
+                from lark_stream import StreamingMarkdownCard, build_final_markdown_card_json
+                from bridge_core.run_session import get_active_run, unregister_active_run
+
+                body = as_v2_markdown or "_（已处理）_"
+                final = build_final_markdown_card_json(body, user_text=user_text)
+                seq = int(task.get("cardkit_sequence") or 0)
+                stream = StreamingMarkdownCard.attach(ck_id, bot_reply_msg_id, sequence=seq)
+                if stream:
+                    stream.failed = False
+                    ok = await app_state.run_feishu_sync(loop, lambda: stream.replace_with_card(final))
+                    if ok:
+                        rs = get_active_run(chat_id)
+                        if rs:
+                            unregister_active_run(chat_id, getattr(rs, "run_id", None))
+                        return
+            except Exception as e:
+                log.warning(f"[Pipeline] CardKit finalize failed, fallback send: {e}")
+        if bot_reply_msg_id and not task.get("cardkit_card_id"):
+            await app_state.run_feishu_sync(loop, lambda: patch_interactive_card_sdk(bot_reply_msg_id, card_json_or_v1))
+        else:
+            await loop.run_in_executor(None, lambda: send_interactive_card_sdk(message_id, card_json_or_v1))
+
     # 1. 安全沙箱门禁拦截（基于 TypeSafe Noul 概率评判与置信度兜底）
     if decision.is_dangerous:
         log.warning(f"[Security] Intercepted dangerous request: '{user_text}' (prob={decision.danger_prob:.2f})")
         warn_card = CardBuilder.build_security_warning(user_text)
-        if bot_reply_msg_id:
-            await app_state.run_feishu_sync(loop, lambda: patch_interactive_card_sdk(bot_reply_msg_id, warn_card))
-        else:
-            await loop.run_in_executor(None, lambda: send_interactive_card_sdk(message_id, warn_card))
+        warn_md = (
+            f"🛡️ **安全拦截**\n\n检测到高风险请求，已阻止执行。\n\n> {user_text[:200]}"
+        )
+        await _finalize_early_card(warn_card, as_v2_markdown=warn_md)
         return
 
     # 2. 插件极速直达通道 (Fast-Path / 零模型冷启动延迟)
@@ -408,7 +435,14 @@ async def _process_single_task(chat_id, task):
             test_result=res,
             tier=cfg.get("tier")
         )
-        if bot_reply_msg_id:
+        # TypeSafe 配置卡仍是交互 V1 结构：有 CardKit 占位时先收口占位，再发配置卡
+        if task.get("cardkit_card_id"):
+            await _finalize_early_card(
+                ts_card,
+                as_v2_markdown="⚙️ TypeSafe 配置面板已另发（见下一条）。",
+            )
+            await loop.run_in_executor(None, lambda: send_interactive_card_sdk(message_id, ts_card))
+        elif bot_reply_msg_id:
             await app_state.run_feishu_sync(loop, lambda: patch_interactive_card_sdk(bot_reply_msg_id, ts_card))
         else:
             await loop.run_in_executor(None, lambda: send_interactive_card_sdk(message_id, ts_card))

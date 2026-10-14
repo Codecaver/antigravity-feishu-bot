@@ -159,6 +159,7 @@ class RunSession:
             return None
         state = create_initial_state(run_id)
         state["chatId"] = chat_id
+        state["cardId"] = card_id
         state["userText"] = user_text
         state["retryUserText"] = user_text
         sess = cls(chat_id, stream, state=state)

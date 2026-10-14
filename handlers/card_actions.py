@@ -95,7 +95,9 @@ def do_p2_card_action_trigger(data: P2CardActionTrigger) -> P2CardActionTriggerR
                             st["chatId"] = target_chat
                             st["cardId"] = cid
                             st = reduce(st, {"type": "interrupted"})
-                            stream = StreamingMarkdownCard.attach(cid, "", sequence=int(time.time()) % 100000)
+                            # sequence 未知时从较大值起步，降低与服务端冲突概率
+                            seq = int(getattr(getattr(rs, "card", None), "sequence", 0) or 0) + 10
+                            stream = StreamingMarkdownCard.attach(cid, "", sequence=max(seq, 1))
                             if stream:
                                 stream.failed = False
                                 stream.replace_with_card(render_card(st))
@@ -128,6 +130,17 @@ def do_p2_card_action_trigger(data: P2CardActionTrigger) -> P2CardActionTriggerR
         user_text = (action_value.get("user_text") or "").strip()
         if not user_text:
             return P2CardActionTriggerResponse({"toast": {"type": "error", "content": "没有可重试的内容"}})
+        # 仍有活跃 run 时先停掉，避免与重试叠卡
+        try:
+            from bridge_core.run_session import get_active_run
+            active = get_active_run(target_chat)
+            if active and (active.state or {}).get("terminal") == "running":
+                active.request_stop()
+                return P2CardActionTriggerResponse({
+                    "toast": {"type": "info", "content": "已请求停止当前任务，请稍后再点重试"}
+                })
+        except Exception:
+            pass
         if app_state.main_loop and app_state.main_loop.is_running():
             content_raw = json.dumps({"text": user_text}, ensure_ascii=False)
 

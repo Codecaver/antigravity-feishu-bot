@@ -423,6 +423,7 @@ def reply_voice_sdk(message_id, file_key):
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic"}
 # abs_path -> deadline; shared dedupe across send_to_feishu / multimodal（图+文件）
 _RECENTLY_SENT_MEDIA = {}
+_RECENTLY_SENT_LOCK = __import__("threading").Lock()
 
 
 def _is_image_path(file_path: str) -> bool:
@@ -432,7 +433,8 @@ def _is_image_path(file_path: str) -> bool:
 def mark_media_sent(file_path: str, ttl_sec: float = 180.0) -> None:
     try:
         import time
-        _RECENTLY_SENT_MEDIA[os.path.abspath(file_path)] = time.time() + ttl_sec
+        with _RECENTLY_SENT_LOCK:
+            _RECENTLY_SENT_MEDIA[os.path.abspath(file_path)] = time.time() + ttl_sec
     except Exception:
         pass
 
@@ -441,13 +443,14 @@ def was_media_recently_sent(file_path: str) -> bool:
     try:
         import time
         abs_p = os.path.abspath(file_path)
-        exp = _RECENTLY_SENT_MEDIA.get(abs_p)
-        if exp is None:
-            return False
-        if time.time() > exp:
-            _RECENTLY_SENT_MEDIA.pop(abs_p, None)
-            return False
-        return True
+        with _RECENTLY_SENT_LOCK:
+            exp = _RECENTLY_SENT_MEDIA.get(abs_p)
+            if exp is None:
+                return False
+            if time.time() > exp:
+                _RECENTLY_SENT_MEDIA.pop(abs_p, None)
+                return False
+            return True
     except Exception:
         return False
 
