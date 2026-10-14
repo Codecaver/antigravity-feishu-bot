@@ -1920,6 +1920,7 @@ async def execute_antigravity(
                     final_json = build_final_markdown_card_json(
                         reply_text or "_(空回复)_",
                         reasoning_text=None if is_error else reasoning_text,
+                        user_text=user_text,
                     )
                     ok = await _feishu_call(
                         lambda: cardkit_stream.replace_with_card(final_json),

@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional
 
-from utils.feishu_markdown import sanitize_feishu_markdown
+from utils.feishu_markdown import format_user_quote, sanitize_feishu_markdown
 
 REASONING_MAX = 1500
 COLLAPSE_TOOL_THRESHOLD = 3
@@ -14,10 +14,17 @@ COLLAPSE_TOOL_THRESHOLD = 3
 def render_card(state: Dict[str, Any], elements_extra: Optional[List[dict]] = None) -> dict:
     elements: List[dict] = []
     terminal = state.get("terminal") or "running"
+
+    # Bridge-like：顶部引用用户原话
+    quote_md = format_user_quote(state.get("userText") or "")
+    if quote_md:
+        elements.append({"tag": "markdown", "content": quote_md})
+
     reasoning = state.get("reasoning") or {}
     if reasoning.get("content"):
         elements.append(_reasoning_panel(reasoning.get("content") or "", bool(reasoning.get("active"))))
 
+    body_added = False
     for group in _group_blocks(state.get("blocks") or []):
         if group["kind"] == "text":
             content = sanitize_feishu_markdown(group.get("content") or "")
@@ -29,8 +36,13 @@ def render_card(state: Dict[str, Any], elements_extra: Optional[List[dict]] = No
                         "content": content,
                     }
                 )
+                body_added = True
         else:
             elements.extend(_render_tool_group(group.get("tools") or [], finalized=terminal != "running"))
+
+    # choice / 额外按钮放在「已完成」之前
+    if elements_extra:
+        elements.extend(elements_extra)
 
     if terminal == "interrupted":
         elements.append(_note("⏹ 已被中断"))
@@ -38,7 +50,7 @@ def render_card(state: Dict[str, Any], elements_extra: Optional[List[dict]] = No
         msg = state.get("errorMsg") or "agent 失败"
         elements.append(_note(f"⚠️ {msg}"))
     elif terminal == "done":
-        if not elements:
+        if not body_added:
             elements.append(_note("_（未返回内容）_"))
         elements.append(_note("_✅ 已完成_"))
 
@@ -55,9 +67,6 @@ def render_card(state: Dict[str, Any], elements_extra: Optional[List[dict]] = No
                 state.get("retryUserText") or state.get("userText") or "",
             )
         )
-
-    if elements_extra:
-        elements.extend(elements_extra)
 
     if not elements:
         elements.append(

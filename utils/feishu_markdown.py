@@ -1,12 +1,14 @@
-"""Normalize model output into Feishu-card-friendly markdown.
+"""Normalize model output into Feishu CardKit-friendly markdown (bridge-like).
 
-Feishu CardKit markdown supports standard fences and lists:
-  - code: ```python ... ```
-  - unordered: `- item`
-  - ordered: `1. item`
+Keep rich formatting that CardKit 2.0 renders well:
+  - headings `#` / `##`
+  - bold / italic
+  - ordered `1.` and unordered `-`
+  - fenced code blocks
+  - GFM tables
+  - blockquotes `>`
 
-Do NOT collapse fences into single backticks, and do NOT replace list markers
-with unicode bullets (•) — those break Feishu native rendering.
+Only scrub things that break Feishu cards (local image paths, file://, bare abs paths).
 """
 
 from __future__ import annotations
@@ -23,15 +25,17 @@ _FILE_MD_LINK = re.compile(
 )
 _BARE_FILE_URL = re.compile(r"file://(/[^\s\)\]\>]+)", re.IGNORECASE)
 _ANGLE_FILE = re.compile(r"<(?:file://)?(/Users/[^\s>]+|/home/[^\s>]+|/tmp/[^\s>]+)>")
-# 裸绝对路径（思考面板/工具输出常见），缩短后包进反引号
 _BARE_ABS_PATH = re.compile(
     r"(?<![`\w])((?:/Users|/home|/private/var|/var/folders|/tmp|/opt)/[^\s`\"'<>\]\)]+)"
 )
 
-# Closed fenced code block (language optional). Keep body untouched.
 _CLOSED_FENCE = re.compile(r"```([^\n`]*)\n([\s\S]*?)\n```")
-# Line that opens a fence (for streaming incomplete blocks)
 _OPEN_FENCE_LINE = re.compile(r"^```([^\n`]*)$", re.MULTILINE)
+# GFM table block: header | --- | rows
+_TABLE_BLOCK = re.compile(
+    r"(?:^[ \t]*\|.+\|[ \t]*\n)(?:^[ \t]*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?[ \t]*\n)(?:^[ \t]*\|.+\|[ \t]*\n?)+",
+    re.MULTILINE,
+)
 
 
 def _pretty_path(raw: str) -> str:
@@ -69,11 +73,21 @@ def _short_path(path: str) -> str:
     return path
 
 
+def format_user_quote(user_text: str, max_chars: int = 280) -> str:
+    """Bridge-like quote of the user message for the card header."""
+    text = re.sub(r"\s+", " ", (user_text or "").strip())
+    if not text:
+        return ""
+    if len(text) > max_chars:
+        text = text[: max_chars - 1] + "…"
+    # Feishu markdown blockquote
+    return f"> {text}"
+
+
 def _sanitize_prose(text: str) -> str:
-    """Sanitize non-code markdown for Feishu cards."""
+    """Sanitize non-code markdown for Feishu cards — preserve rich structure."""
 
     def _img_sub(m: re.Match) -> str:
-        # Feishu cards need image_key; local/http markdown images break patch (11310).
         target = (m.group(2) or "").strip()
         if target.startswith(("http://", "https://", "img_v")):
             alt = (m.group(1) or "").strip() or "图片"
@@ -93,53 +107,42 @@ def _sanitize_prose(text: str) -> str:
                 pretty = alt
         return f"`{pretty}`"
 
-    out = _MD_IMAGE.sub(_img_sub, text)
+    # Protect table blocks from bullet/heading rewrites
+    tables: list[str] = []
+
+    def _park_table(m: re.Match) -> str:
+        tables.append(m.group(0))
+        return f"\n@@TABLE{len(tables) - 1}@@\n"
+
+    out = _TABLE_BLOCK.sub(_park_table, text)
+
+    out = _MD_IMAGE.sub(_img_sub, out)
     out = _FILE_MD_LINK.sub(_link_sub, out)
     out = _ANGLE_FILE.sub(lambda m: f"`{_pretty_path(m.group(1))}`", out)
     out = _BARE_FILE_URL.sub(lambda m: f"`{_pretty_path(m.group(1))}`", out)
     out = _BARE_ABS_PATH.sub(lambda m: f"`{_pretty_path(m.group(1))}`", out)
 
-    # Headings → bold (Feishu mobile card markdown is weak on # headers)
-    out = re.sub(r"^(#{1,6})\s*(.+)$", r"**\2**", out, flags=re.MULTILINE)
+    # Keep ATX headings (# / ## / ###). CardKit 2.0 renders them better as bold+size cues;
+    # use bold for h1/h2 visual weight while preserving a blank line after.
+    def _heading_sub(m: re.Match) -> str:
+        level = len(m.group(1))
+        title = (m.group(2) or "").strip()
+        if level <= 2:
+            return f"**{title}**\n"
+        return f"**{title}**"
 
-    # Unicode / weird bullets → Feishu-native ordered lists when 2+ consecutive
-    # otherwise keep as `- ` unordered (also native). Never leave `•`/`·`.
+    out = re.sub(r"^(#{1,6})\s+(.+)$", _heading_sub, out, flags=re.MULTILINE)
+
+    # Weird unicode bullets → `- ` (keep as unordered; do NOT force numbered)
     out = re.sub(r"^[\t ]*[•·▪◦]\s+", "- ", out, flags=re.MULTILINE)
-    # Nested indent bullets: normalize to single-level `- ` (Feishu cards)
-    out = re.sub(r"^[\t ]+([-*])\s+", r"- ", out, flags=re.MULTILINE)
-    # `*` list markers → `-` (avoid clashing with emphasis / star unpack in prose)
+    # Only convert list-marker star at line start (`* item`), not italic `*word*`
     out = re.sub(r"^\*\s+", "- ", out, flags=re.MULTILINE)
 
-    out = _bullets_to_ordered(out)
+    # Restore tables
+    for i, table in enumerate(tables):
+        out = out.replace(f"@@TABLE{i}@@", table.strip("\n"))
+
     return out
-
-
-def _bullets_to_ordered(text: str) -> str:
-    """Turn consecutive `- item` runs (len>=2) into `1. 2. 3.` Feishu sequences."""
-    lines = text.split("\n")
-    out: list[str] = []
-    i = 0
-    bullet_re = re.compile(r"^- (.+)$")
-
-    while i < len(lines):
-        m = bullet_re.match(lines[i])
-        if not m:
-            out.append(lines[i])
-            i += 1
-            continue
-        block = []
-        while i < len(lines):
-            bm = bullet_re.match(lines[i])
-            if not bm:
-                break
-            block.append(bm.group(1))
-            i += 1
-        if len(block) >= 2:
-            for idx, item in enumerate(block, 1):
-                out.append(f"{idx}. {item}")
-        else:
-            out.append(f"- {block[0]}")
-    return "\n".join(out)
 
 
 def _iter_fence_segments(text: str) -> Iterator[Tuple[str, str]]:
@@ -148,21 +151,18 @@ def _iter_fence_segments(text: str) -> Iterator[Tuple[str, str]]:
     for m in _CLOSED_FENCE.finditer(text):
         if m.start() > pos:
             yield "prose", text[pos : m.start()]
-        # Preserve fence exactly (normalize rare \r\n only)
         fence = m.group(0).replace("\r\n", "\n")
         yield "code", fence
         pos = m.end()
     tail = text[pos:]
     if not tail:
         return
-    # Incomplete streaming fence: leave raw from opening ``` to end
     open_m = _OPEN_FENCE_LINE.search(tail)
     if open_m and "```" not in tail[open_m.end() :]:
         if open_m.start() > 0:
             yield "prose", tail[: open_m.start()]
         yield "code", tail[open_m.start() :]
     else:
-        # half-closed or no fence
         yield "prose", tail
 
 
@@ -177,4 +177,5 @@ def sanitize_feishu_markdown(text: str) -> str:
             parts.append(chunk)
         else:
             parts.append(_sanitize_prose(chunk))
-    return "".join(parts).strip()
+    # Collapse 3+ blank lines
+    return re.sub(r"\n{3,}", "\n\n", "".join(parts)).strip()

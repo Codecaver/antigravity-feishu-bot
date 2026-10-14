@@ -519,7 +519,7 @@ async def _process_single_task(chat_id, task):
             "Any English text in the response must be limited to code syntax or technical names only. "
             "最终对用户可见的正文用简体中文直接回答；如需短暂推理，请放在 <thinking>...</thinking> 中，系统会单独折叠展示。]\n\n"
             "[Role: A friendly, concise and warm AI assistant. Reply naturally and warmly in 1-2 natural sentences without calling tools or explaining technical rules.]\n\n"
-            "[Feishu Style] 禁止 file:// 链接与绝对路径 Markdown；文件路径用反引号相对路径。\n\n"
+            "[Feishu Style] 可用 `## 标题`、**粗体**、表格与 `1.` 列表；禁止 file://；路径用反引号短路径。\n\n"
             "[System One Adaptive Reasoning: LOW]\n"
             "当前任务判定为轻量日常问答或闲聊，请以极简快速思考直接给出精炼回答，避免冗长思考与过度分析。\n\n"
         )
@@ -538,17 +538,16 @@ async def _process_single_task(chat_id, task):
 
         system_instruction += (
             "[System Feishu Reply Style / 飞书消息排版规范]\n"
-            "1. 回复显示在飞书卡片：简体中文短段落；多条说明用有序序列 `1. 2. 3.`（不要用 `•`/`·` 圆点）。\n"
-            "2. 代码必须用标准围栏，且语言标记单独成行，例如：\n"
+            "回复会显示在飞书 CardKit 卡片中，请主动使用丰富 Markdown，接近正式技术回复：\n"
+            "1. 用 `## 小节标题` 分段；重点用 **粗体**；补充说明可用 *斜体*。\n"
+            "2. 并列要点用有序 `1. 2. 3.` 或无序 `- `；对比信息优先用 GFM 表格：\n"
+            "| 列A | 列B |\n| --- | --- |\n| a | b |\n"
+            "3. 代码必须用标准围栏（语言标记单独成行），例如：\n"
             "```python\nprint('hi')\n```\n"
-            "严禁把代码塞进单行反引号；围栏内保持缩进，不要改写成列表。\n"
-            "3. 【禁止】`file://`、`vscode://`、`[file:///...](file:///...)`。"
-            "文件路径写相对路径反引号，如 `cards/indicators.py:538-585`。\n"
-            "4. 【禁止】HTML、嵌套怪链；正文与思考里不要粘贴冗长绝对路径（系统会自动脱敏）。\n"
-            "5. 【生成图片】完成后只在回复写一行：`![简短说明](本地图片完整路径)`，"
-            "**禁止**调用 `send_to_feishu.py` 或其它脚本推送图片/说明文字；系统会自动发一张原生图片。\n"
-            "6. 非图片交付物优先写 Markdown 链接 `[名.xlsx](本地完整路径)`，由系统投递；"
-            "仅在系统未投递时才可使用 `python3 send_to_feishu.py <路径>`（不要对图片使用）。\n\n"
+            "严禁把多行代码塞进单行反引号。\n"
+            "4. 【禁止】`file://` / HTML；路径用反引号短路径，如 `cards/indicators.py`。\n"
+            "5. 【生成图片】只写 `![简短说明](本地图片完整路径)`，**禁止**再调 `send_to_feishu.py`。\n"
+            "6. 非图片文件可用 `[名.xlsx](本地完整路径)` 交由系统投递。\n\n"
         )
 
         if task.get("message_type") == "audio" or task.get("is_voice_message"):

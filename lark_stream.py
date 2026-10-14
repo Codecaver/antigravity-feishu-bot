@@ -92,16 +92,22 @@ def build_final_markdown_card_json(
     text: str,
     elements_extra: Optional[list] = None,
     reasoning_text: Optional[str] = None,
+    user_text: Optional[str] = None,
 ) -> dict:
-    """Schema 2.0 final card (streaming off)，可选保留思考折叠面板。"""
+    """Schema 2.0 final card (streaming off)，可选保留思考折叠面板与用户引用。"""
+    from utils.feishu_markdown import format_user_quote, sanitize_feishu_markdown
+
     body_elements = []
+    quote = format_user_quote(user_text or "")
+    if quote:
+        body_elements.append({"tag": "markdown", "content": quote})
     if reasoning_text and reasoning_text.strip():
         body_elements.append(build_reasoning_collapsible(reasoning_text, expanded=False))
     body_elements.append(
         {
             "tag": "markdown",
             "element_id": ELEMENT_ID,
-            "content": text or "_(空回复)_",
+            "content": sanitize_feishu_markdown(text) or "_(空回复)_",
         }
     )
     if elements_extra:
