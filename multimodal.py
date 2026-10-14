@@ -127,8 +127,15 @@ def extract_and_upload_resources(text, message_id, api_client, additional_safe_d
                 log.error(f"[Multimodal] Error scanning md file: {e}")
 
     def _send_image(img_path: str) -> bool:
+        from lark_client import mark_image_sent, was_image_recently_sent
+
         abs_img = os.path.abspath(img_path)
         if abs_img in delivered_abs:
+            return True
+        # Agent 已通过 send_to_feishu 推过同一张图 → 跳过，避免 file+image 双发
+        if was_image_recently_sent(abs_img):
+            log.info(f"[Multimodal] Skip already-sent image: {abs_img}")
+            delivered_abs.add(abs_img)
             return True
         if not is_safe_path(img_path):
             log.warning(f"[Multimodal] Blocked unsafe image upload path: {img_path}")
@@ -156,6 +163,7 @@ def extract_and_upload_resources(text, message_id, api_client, additional_safe_d
                         ).build()
                         api_client.im.v1.message.create(msg_req)
                     delivered_abs.add(abs_img)
+                    mark_image_sent(abs_img)
                     return True
             else:
                 log.error(f"[Multimodal] Failed to upload image: {resp.msg}")

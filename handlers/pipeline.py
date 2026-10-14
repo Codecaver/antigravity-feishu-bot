@@ -544,8 +544,12 @@ async def _process_single_task(chat_id, task):
             "严禁把代码塞进单行反引号；围栏内保持缩进，不要改写成列表。\n"
             "3. 【禁止】`file://`、`vscode://`、`[file:///...](file:///...)`。"
             "文件路径写相对路径反引号，如 `cards/indicators.py:538-585`。\n"
-            "4. 【禁止】HTML、嵌套怪链。需要发文件下载时用 `[名.xlsx](/绝对路径/文件.xlsx)`（不要 file://），"
-            "或 `python3 send_to_feishu.py <路径>`。\n\n"
+            "4. 【禁止】HTML、嵌套怪链。\n"
+            "5. 【生成图片】完成后只需在回复正文写 `![简短说明](/绝对路径/图.jpg)`，"
+            "**禁止**再调用 `send_to_feishu.py` / 任何脚本推送图片（系统会自动发一张原生图片消息）。"
+            "不要单独再发说明短句到会话。\n"
+            "6. 非图片文件（xlsx/pdf/zip 等）才可用 `[名.xlsx](/绝对路径/文件.xlsx)` "
+            "或 `python3 send_to_feishu.py <路径>` 推送下载。\n\n"
         )
 
         if task.get("message_type") == "audio" or task.get("is_voice_message"):

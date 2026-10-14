@@ -49,9 +49,12 @@ def send_file(file_path, chat_id=None, caption=None):
     if not chat_id:
         return False, "未找到目标会话，请显式传入 chat_id"
 
+    # 图片：send_local_file_to_chat 内部只发原生 image，忽略 caption（避免多一条说明文字）
     ok = send_local_file_to_chat(chat_id, file_path, caption=caption)
     if ok:
-        return True, f"✅ 已通过 Lark API 成功发送文件: {file_path} -> {chat_id}"
+        ext = os.path.splitext(file_path)[1].lower()
+        kind = "图片" if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic"} else "文件"
+        return True, f"✅ 已通过 Lark API 成功发送{kind}: {file_path} -> {chat_id}"
     return False, f"❌ 发送失败: {file_path} -> {chat_id}"
 
 

@@ -420,8 +420,87 @@ def reply_voice_sdk(message_id, file_key):
     return True
 
 
+_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic"}
+# abs_path -> monotonic deadline; shared dedupe with multimodal
+_RECENTLY_SENT_IMAGES = {}
+
+
+def _is_image_path(file_path: str) -> bool:
+    return os.path.splitext((file_path or "").lower())[1] in _IMAGE_EXTS
+
+
+def mark_image_sent(file_path: str, ttl_sec: float = 120.0) -> None:
+    try:
+        import time
+        _RECENTLY_SENT_IMAGES[os.path.abspath(file_path)] = time.time() + ttl_sec
+    except Exception:
+        pass
+
+
+def was_image_recently_sent(file_path: str) -> bool:
+    try:
+        import time
+        abs_p = os.path.abspath(file_path)
+        exp = _RECENTLY_SENT_IMAGES.get(abs_p)
+        if exp is None:
+            return False
+        if time.time() > exp:
+            _RECENTLY_SENT_IMAGES.pop(abs_p, None)
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def send_local_image_to_chat(chat_id, file_path) -> bool:
+    """Upload local image and send as Feishu native image message (not file)."""
+    if not chat_id or not file_path or not os.path.isfile(file_path):
+        return False
+    if was_image_recently_sent(file_path):
+        log.info(f"[send_local_image_to_chat] skip duplicate {file_path}")
+        return True
+    try:
+        with open(file_path, "rb") as f:
+            req = lark.api.im.v1.CreateImageRequest.builder().request_body(
+                lark.api.im.v1.CreateImageRequestBody.builder()
+                .image_type("message")
+                .image(f)
+                .build()
+            ).build()
+            resp = api_client.im.v1.image.create(req)
+        if resp.code != 0:
+            log.error(f"[send_local_image_to_chat] upload failed: {resp.msg}")
+            return False
+        img_key = json.loads(resp.raw.content).get("data", {}).get("image_key")
+        if not img_key:
+            return False
+        msg_req = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(
+            CreateMessageRequestBody.builder()
+            .receive_id(chat_id)
+            .msg_type("image")
+            .content(json.dumps({"image_key": img_key}))
+            .build()
+        ).build()
+        msg_resp = api_client.im.v1.message.create(msg_req)
+        if msg_resp.code != 0:
+            log.error(f"[send_local_image_to_chat] send failed: {msg_resp.msg}")
+            return False
+        mark_image_sent(file_path)
+        log.info(f"[send_local_image_to_chat] sent image_key={img_key} chat={chat_id}")
+        return True
+    except Exception as e:
+        log.error(f"[send_local_image_to_chat] error: {e}")
+        return False
+
+
 def send_local_file_to_chat(chat_id, file_path, file_type=None, caption=None, duration_ms=None):
-    """组合工具：直接上传本地文件并通过 Lark API 发送到指定会话。"""
+    """组合工具：直接上传本地文件并通过 Lark API 发送到指定会话。
+
+    图片一律按原生 image 发送（不发 file、不另发 caption 文本），避免刷屏。
+    """
+    if _is_image_path(file_path):
+        return send_local_image_to_chat(chat_id, file_path)
+
     file_key = upload_file_sdk(file_path, file_type=file_type, duration_ms=duration_ms)
     if not file_key:
         return False
@@ -433,7 +512,35 @@ def send_local_file_to_chat(chat_id, file_path, file_type=None, caption=None, du
 
 
 def send_local_file_as_reply(message_id, file_path, file_type=None, caption=None, duration_ms=None):
-    """组合工具：直接上传本地文件并通过 Lark API 回复指定消息。"""
+    """组合工具：直接上传本地文件并通过 Lark API 回复指定消息。图片走 image，不发 file。"""
+    if _is_image_path(file_path):
+        # reply path: upload image then reply with image msg
+        try:
+            with open(file_path, "rb") as f:
+                req = lark.api.im.v1.CreateImageRequest.builder().request_body(
+                    lark.api.im.v1.CreateImageRequestBody.builder()
+                    .image_type("message")
+                    .image(f)
+                    .build()
+                ).build()
+                resp = api_client.im.v1.image.create(req)
+            if resp.code != 0:
+                return False
+            img_key = json.loads(resp.raw.content).get("data", {}).get("image_key")
+            if not img_key:
+                return False
+            msg_req = ReplyMessageRequest.builder().message_id(message_id).request_body(
+                ReplyMessageRequestBody.builder()
+                .msg_type("image")
+                .content(json.dumps({"image_key": img_key}))
+                .build()
+            ).build()
+            msg_resp = api_client.im.v1.message.reply(msg_req)
+            return msg_resp.code == 0
+        except Exception as e:
+            log.error(f"[send_local_file_as_reply] image error: {e}")
+            return False
+
     file_key = upload_file_sdk(file_path, file_type=file_type, duration_ms=duration_ms)
     if not file_key:
         return False
