@@ -73,13 +73,35 @@ def do_p2_card_action_trigger(data: P2CardActionTrigger) -> P2CardActionTriggerR
     if action_value.get("action") == "stop_run":
         target_chat = action_value.get("chat_id") or chat_id
         run_id = action_value.get("run_id") or ""
+        card_id = action_value.get("card_id") or ""
 
         def _do_stop():
             try:
                 from bridge_core.run_session import get_active_run
+                from bridge_core.run_renderer import render_card
+                from bridge_core.run_state import create_initial_state, reduce
+                from lark_stream import StreamingMarkdownCard
+
                 rs = get_active_run(target_chat)
+                stopped = False
                 if rs and (not run_id or rs.run_id == run_id):
-                    rs.request_stop()
+                    stopped = bool(rs.request_stop())
+                else:
+                    # 会话已结束/错位：仍把该张「思考中」卡刷成已中断，避免僵尸停止键
+                    cid = card_id or (getattr(rs, "card_id", "") if rs else "")
+                    if cid:
+                        try:
+                            st = create_initial_state(run_id or None)
+                            st["chatId"] = target_chat
+                            st["cardId"] = cid
+                            st = reduce(st, {"type": "interrupted"})
+                            stream = StreamingMarkdownCard.attach(cid, "", sequence=int(time.time()) % 100000)
+                            if stream:
+                                stream.failed = False
+                                stream.replace_with_card(render_card(st))
+                                stopped = True
+                        except Exception as e:
+                            log.warning(f"[stop_run] orphan card update failed: {e}")
                 proc = running_processes.get(target_chat)
                 if proc is not None:
                     try:
@@ -87,8 +109,11 @@ def do_p2_card_action_trigger(data: P2CardActionTrigger) -> P2CardActionTriggerR
                             os.killpg(os.getpgid(proc.pid), 15)
                         elif hasattr(proc, "terminate"):
                             proc.terminate()
+                        running_processes.pop(target_chat, None)
                     except Exception as e:
                         log.warning(f"[stop_run] kill process failed: {e}")
+                if not stopped:
+                    log.info(f"[stop_run] no active run chat={target_chat} run_id={run_id}")
             except Exception as e:
                 log.warning(f"[stop_run] failed: {e}")
 

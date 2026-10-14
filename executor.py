@@ -1858,11 +1858,19 @@ async def execute_antigravity(
 
             # Bridge 终态：RunSession.finish_done / finish_error（单卡 + 可选 choice 按钮）
             delivered_via_cardkit = False
-            if run_session and not run_session.failed and not is_voice_message:
+            if run_session and not is_voice_message:
                 try:
                     await _flush_cardkit_pushes()
                     # 用户已点停止：保持 interrupted，勿再刷成 done/error
                     if getattr(run_session, "stop_requested", False) or run_session.state.get("terminal") == "interrupted":
+                        # 再刷一次 interrupted，清掉停止按钮
+                        if getattr(run_session, "card", None):
+                            run_session.card.failed = False
+                        await _feishu_call(
+                            lambda: run_session.finish_interrupted(),
+                            timeout=12.0,
+                            label="run_session finish_interrupted",
+                        )
                         delivered_via_cardkit = True
                     else:
                         extra = []
@@ -1894,6 +1902,9 @@ async def execute_antigravity(
                                 })
                             # CardKit 2.0: 按钮直接进 elements，勿包 tag:action
                             extra.extend(btns)
+                        if getattr(run_session, "card", None):
+                            run_session.card.failed = False
+                        run_session.failed = False
                         if is_error:
                             ok = await _feishu_call(
                                 lambda: run_session.finish_error(reply_text or "执行失败"),
@@ -1911,9 +1922,24 @@ async def execute_antigravity(
                                 label="run_session finish_done",
                             )
                         delivered_via_cardkit = bool(ok)
+                        if not ok and run_session.card_id:
+                            # 再试一次 CardKit 终态卡，禁止掉进 V1 patch
+                            from lark_stream import build_final_markdown_card_json
+                            final_json = build_final_markdown_card_json(
+                                reply_text or "_(空回复)_",
+                                reasoning_text=None if is_error else reasoning_text,
+                                user_text=user_text,
+                            )
+                            run_session.card.failed = False
+                            ok2 = await _feishu_call(
+                                lambda: run_session.card.replace_with_card(final_json),
+                                timeout=12.0,
+                                label="cardkit final replace retry",
+                            )
+                            delivered_via_cardkit = bool(ok2)
                 except Exception as e:
                     log.warning(f"[Executor] RunSession final delivery failed: {e}")
-            elif cardkit_stream and not cardkit_stream.failed and not is_voice_message:
+            elif cardkit_stream and not is_voice_message:
                 try:
                     await _flush_cardkit_pushes()
                     from lark_stream import build_final_markdown_card_json
@@ -1922,6 +1948,7 @@ async def execute_antigravity(
                         reasoning_text=None if is_error else reasoning_text,
                         user_text=user_text,
                     )
+                    cardkit_stream.failed = False
                     ok = await _feishu_call(
                         lambda: cardkit_stream.replace_with_card(final_json),
                         timeout=12.0,
@@ -1931,47 +1958,37 @@ async def execute_antigravity(
                 except Exception as e:
                     log.warning(f"[Executor] CardKit final delivery failed: {e}")
             if not delivered_via_cardkit:
+                # CardKit V2 消息不能用 schema V1 patch；改为新发一张终态卡，避免僵尸「思考中」
                 try:
                     import importlib
                     import cards.response as _resp_mod
                     importlib.reload(_resp_mod)
                 except Exception:
                     pass
-                final_card = CardBuilder.build_ai_response(
-                    reply_text,
-                    choice_card_data=choice_card_data,
-                    current_model=session_data.get('model', 'Default'),
-                    current_project=session_data.get('project', '默认'),
-                    is_error=is_error,
-                    is_streaming=False,
-                    session_data=session_data,
-                    is_quota=is_quota_exhausted,
+                from lark_stream import build_final_markdown_card_json, create_card_entity, reply_card_by_ref
+                final_json = build_final_markdown_card_json(
+                    reply_text or "_(空回复)_",
                     reasoning_text=None if is_error else reasoning_text,
+                    user_text=user_text,
                 )
-                if bot_reply_msg_id:
-                    patch_ok = await _feishu_call(
-                        lambda: patch_interactive_card_sdk(bot_reply_msg_id, final_card),
-                        label="final-card patch"
+                new_card_id = await _feishu_call(
+                    lambda: create_card_entity(final_json),
+                    timeout=12.0,
+                    label="final-cardkit create",
+                )
+                if new_card_id and message_id:
+                    await _feishu_call(
+                        lambda: reply_card_by_ref(message_id, new_card_id),
+                        timeout=12.0,
+                        label="final-cardkit reply",
                     )
-                    if patch_ok is None:
-                        from lark_client import send_reply_sdk
-                        fallback_text = reply_text[:2000] if reply_text else "(AI 回复卡片发送失败，请查看工作区获取完整内容)"
-                        await _feishu_call(
-                            lambda: send_reply_sdk(message_id, fallback_text),
-                            label="final-card text fallback"
-                        )
                 else:
-                    if message_id and str(message_id).startswith("om_"):
-                        await _feishu_call(
-                            lambda: send_interactive_card_sdk(message_id, final_card),
-                            label="final-card send"
-                        )
-                    else:
-                        from lark_client import send_card_to_chat_sdk
-                        await _feishu_call(
-                            lambda: send_card_to_chat_sdk(chat_id, final_card),
-                            label="final-card send to chat"
-                        )
+                    from lark_client import send_reply_sdk
+                    fallback_text = reply_text[:2000] if reply_text else "(AI 回复卡片发送失败)"
+                    await _feishu_call(
+                        lambda: send_reply_sdk(message_id, fallback_text),
+                        label="final-card text fallback",
+                    )
 
             return {"has_reply": bool(final_reply), "returncode": process.returncode, "is_error": is_error, "is_quota_error": is_quota_exhausted}
 

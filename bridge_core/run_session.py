@@ -128,6 +128,12 @@ class RunSession:
             if not msg_id:
                 return None
             stream = StreamingMarkdownCard.attach(card_id, msg_id, sequence=0)
+            state["cardId"] = card_id
+            # 刷新一次，让停止按钮带上 card_id（首屏 create 时还没有）
+            try:
+                stream.replace_with_card(render_card(state))
+            except Exception:
+                pass
             sess = cls(chat_id, stream, state=state, run_id=run_id)
             sess._body_ready = True  # render_card(running) 始终带 md_body
             sess._last_structure_sig = _structure_signature(state)
@@ -168,8 +174,9 @@ class RunSession:
         return self.state
 
     def push(self, force: bool = False, elements_extra: Optional[list] = None) -> bool:
-        if self.failed or not self.card or self.card.failed:
+        if not self.card or not self.card_id:
             return False
+        # card.failed 仅表示上次不可恢复；终态/结构更新仍尝试 replace 自愈
         now = time.time()
         terminal = self.state.get("terminal") or "running"
         sig = _structure_signature(self.state, elements_extra)
@@ -181,6 +188,7 @@ class RunSession:
             and not structure_changed
             and elements_extra is None
             and self._body_ready
+            and not getattr(self.card, "failed", False)
         ):
             if (not force) and (now - self._last_push_at) < self._content_min_interval:
                 self._dirty = True
@@ -188,10 +196,11 @@ class RunSession:
             text = sanitize_feishu_markdown(assistant_text(self.state) or "…") or "…"
             ok = self.card.set_content(text, force=True)
             if not ok:
-                # element 可能丢了，退回整卡
+                # element patch 失败（超时等）→ 整卡替换自愈，勿放弃单卡
                 return self._push_full(elements_extra=None, sig=sig)
             self._last_push_at = time.time()
             self._dirty = False
+            self.failed = False
             return True
 
         # 终态 / 结构变化：整卡替换
@@ -211,6 +220,9 @@ class RunSession:
         sig: Optional[Tuple] = None,
     ) -> bool:
         card_json = render_card(self.state, elements_extra=elements_extra)
+        # 允许从 content 失败中恢复
+        if getattr(self.card, "failed", False) and (self.state.get("terminal") or "") != "running":
+            self.card.failed = False
         ok = self.card.replace_with_card(card_json)
         if not ok:
             text = assistant_text(self.state) or _fallback_md(self.state)
@@ -218,12 +230,12 @@ class RunSession:
             if not ok:
                 self.failed = True
                 return False
+        self._body_ready = True
+        self.failed = False
+        if sig is not None:
+            self._last_structure_sig = sig
         else:
-            self._body_ready = True
-            if sig is not None:
-                self._last_structure_sig = sig
-            else:
-                self._last_structure_sig = _structure_signature(self.state, elements_extra)
+            self._last_structure_sig = _structure_signature(self.state, elements_extra)
         self._last_push_at = time.time()
         self._dirty = False
         return True

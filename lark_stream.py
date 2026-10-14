@@ -173,8 +173,9 @@ class StreamingMarkdownCard:
             return None
 
     def set_content(self, text: str, force: bool = False) -> bool:
-        if self.failed or not self.card_id:
+        if not self.card_id:
             return False
+        # 内容 patch 失败是可恢复的（网关超时等），勿永久 failed，留给 replace_with_card
         text = sanitize_feishu_markdown(text) if text else "…"
         if not text:
             text = "…"
@@ -190,13 +191,12 @@ class StreamingMarkdownCard:
             self.sequence += 1
             ok = _update_element_content(self.card_id, ELEMENT_ID, text, self.sequence)
             if not ok:
-                self.failed = True
                 return False
             self._last_push_at = time.time()
+            self.failed = False
             return True
         except Exception as e:
             log.warning(f"[CardKit] set_content failed: {e}")
-            self.failed = True
             return False
 
     def finish(self, final_text: Optional[str] = None) -> bool:
@@ -238,7 +238,7 @@ class StreamingMarkdownCard:
 
     def replace_with_card(self, card_json: dict) -> bool:
         """Replace entire card entity (e.g. final text + choice buttons)."""
-        if self.failed or not self.card_id:
+        if not self.card_id:
             return False
         try:
             self.sequence += 1
@@ -258,7 +258,11 @@ class StreamingMarkdownCard:
             resp = api_client.cardkit.v1.card.update(req)
             if resp.code != 0:
                 log.warning(f"[CardKit] replace_with_card failed: {resp.code} {resp.msg}")
+                # 仅在明确不可恢复时标记 failed（schema/权限类）
+                if int(getattr(resp, "code", 0) or 0) in (200861, 200830, 230099):
+                    self.failed = True
                 return False
+            self.failed = False
             return True
         except Exception as e:
             log.warning(f"[CardKit] replace_with_card error: {e}")

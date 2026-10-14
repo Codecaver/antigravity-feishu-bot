@@ -75,7 +75,13 @@ def render_card(state: Dict[str, Any], elements_extra: Optional[List[dict]] = No
                     "content": f"_{activity}_" if not activity.startswith("_") else activity,
                 }
             )
-        elements.append(_stop_button(state.get("runId") or "", state.get("chatId") or ""))
+        elements.append(
+            _stop_button(
+                state.get("runId") or "",
+                state.get("chatId") or "",
+                state.get("cardId") or "",
+            )
+        )
     elif state.get("runId") and terminal in ("error", "interrupted"):
         elements.append(
             _retry_button(
@@ -225,8 +231,15 @@ def _summary_text(state: Dict[str, Any], max_chars: int = 40) -> str:
     return cleaned if len(cleaned) <= max_chars else cleaned[: max_chars - 1] + "…"
 
 
-def _stop_button(run_id: str, chat_id: str) -> dict:
+def _stop_button(run_id: str, chat_id: str, card_id: str = "") -> dict:
     # CardKit schema 2.0: button 直接放 elements，禁止再包 tag:action
+    value = {
+        "action": "stop_run",
+        "run_id": run_id,
+        "chat_id": chat_id,
+    }
+    if card_id:
+        value["card_id"] = card_id
     return {
         "tag": "button",
         "element_id": "btn_stop",
@@ -236,11 +249,7 @@ def _stop_button(run_id: str, chat_id: str) -> dict:
         "behaviors": [
             {
                 "type": "callback",
-                "value": {
-                    "action": "stop_run",
-                    "run_id": run_id,
-                    "chat_id": chat_id,
-                },
+                "value": value,
             }
         ],
     }

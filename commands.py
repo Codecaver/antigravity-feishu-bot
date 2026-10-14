@@ -400,10 +400,29 @@ async def handle_slash_command(user_text, message_id, chat_id, session_data, run
 
         elif pending_command == PendingCommand.CRON_ADD.value:
             raw_input = user_text.strip()
+            # 用户取消创建定时任务，避免普通对话被 pending 吞掉
+            if raw_input.lower() in ("取消", "cancel", "/cancel") or any(
+                k in raw_input for k in ("不用了", "不用测试", "算了", "取消创建")
+            ):
+                session_data.pop("pending_command", None)
+                await save_session_async(chat_id, session_data)
+                await asyncio.get_running_loop().run_in_executor(
+                    None, lambda: send_reply_sdk(message_id, "已取消创建定时任务。")
+                )
+                return True, user_text
             import re, time
             parts = [p.strip() for p in re.split(r'[|｜]', raw_input) if p.strip()]
             if len(parts) < 3:
-                reply_text = "❌ **格式无效！**\n\n请按规范发送 3 段数据，用竖线 `|` 隔开：\n`任务名称 | 触发规则(如 0 9 * * * 或 600s) | 执行 Prompt`\n\n例如：`定时检查存储 | 0 9 * * * | 检查树莓派 iSCSI 运行状态`"
+                reply_text = (
+                    "❌ **格式无效！**\n\n请按规范发送 3 段数据，用竖线 `|` 隔开：\n"
+                    "`任务名称 | 触发规则(如 0 9 * * * 或 600s) | 执行 Prompt`\n\n"
+                    "例如：`定时检查存储 | 0 9 * * * | 检查树莓派 iSCSI 运行状态`\n\n"
+                    "回复「取消」可退出创建。"
+                )
+                await asyncio.get_running_loop().run_in_executor(
+                    None, lambda: send_reply_sdk(message_id, reply_text)
+                )
+                return True, user_text
             else:
                 name, expr, prompt = parts[0], parts[1], parts[2]
                 task_type = 'delay' if re.match(r'^\d+\s*[s|m|h|d]?$', expr.lower()) else 'cron'
