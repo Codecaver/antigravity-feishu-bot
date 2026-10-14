@@ -70,6 +70,54 @@ def do_p2_card_action_trigger(data: P2CardActionTrigger) -> P2CardActionTriggerR
         if not is_admin(chat_id):
             return P2CardActionTriggerResponse({"toast": {"type": "error", "content": "🔒 此操作仅管理员可用！"}})
 
+    if action_value.get("action") == "stop_run":
+        target_chat = action_value.get("chat_id") or chat_id
+        run_id = action_value.get("run_id") or ""
+
+        def _do_stop():
+            try:
+                from bridge_core.run_session import get_active_run
+                rs = get_active_run(target_chat)
+                if rs and (not run_id or rs.run_id == run_id):
+                    rs.request_stop()
+                proc = running_processes.get(target_chat)
+                if proc is not None:
+                    try:
+                        if hasattr(proc, "pid") and proc.pid:
+                            os.killpg(os.getpgid(proc.pid), 15)
+                        elif hasattr(proc, "terminate"):
+                            proc.terminate()
+                    except Exception as e:
+                        log.warning(f"[stop_run] kill process failed: {e}")
+            except Exception as e:
+                log.warning(f"[stop_run] failed: {e}")
+
+        if app_state.main_loop and app_state.main_loop.is_running():
+            app_state.main_loop.call_soon_threadsafe(_do_stop)
+        else:
+            _do_stop()
+        return P2CardActionTriggerResponse({"toast": {"type": "info", "content": "已请求停止"}})
+
+    if action_value.get("action") == "retry_run":
+        target_chat = action_value.get("chat_id") or chat_id
+        user_text = (action_value.get("user_text") or "").strip()
+        if not user_text:
+            return P2CardActionTriggerResponse({"toast": {"type": "error", "content": "没有可重试的内容"}})
+        if app_state.main_loop and app_state.main_loop.is_running():
+            content_raw = json.dumps({"text": user_text}, ensure_ascii=False)
+
+            async def do_retry():
+                await _handle_message_async_internal(
+                    card_message_id, target_chat, "text", content_raw
+                )
+
+            try:
+                asyncio.run_coroutine_threadsafe(do_retry(), app_state.main_loop)
+            except Exception as e:
+                log.error(f"[retry_run] enqueue failed: {e}")
+                return P2CardActionTriggerResponse({"toast": {"type": "error", "content": "重试入队失败"}})
+        return P2CardActionTriggerResponse({"toast": {"type": "info", "content": "已重新发起"}})
+
     if action_value.get("action") == "app_scope_grant":
         if not is_admin(chat_id):
             return P2CardActionTriggerResponse({"toast": {"type": "error", "content": "🔒 仅管理员可申请开放平台权限"}})

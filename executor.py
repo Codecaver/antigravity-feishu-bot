@@ -954,31 +954,77 @@ async def execute_antigravity(
                 )
             )
 
-            if attempt == 1:
-                if is_resumed:
-                    init_card = CardBuilder.build_typing_indicator(
-                        downloaded_file_name, download_success,
-                        f"🔄 检测到服务刚完成重启，正在自动继续执行未完成的任务...\n\n{user_text}",
-                        is_voice=is_voice_message
-                    )
-                else:
-                    init_card = CardBuilder.build_typing_indicator(
-                        downloaded_file_name, download_success, user_text, is_voice=is_voice_message
-                    )
-            else:
-                init_card = CardBuilder.build_typing_indicator(
-                    downloaded_file_name, download_success,
-                    f"🔄 首次发起因无响应挂死，正在自动为您重新发起第 {attempt}/2 次重试...\n\n{user_text}",
-                    is_voice=is_voice_message
-                )
+            # Bridge-like RunSession：一张 CardKit 卡承载整轮 run（优先续用 pipeline 占位）
+            run_session = None
+            cardkit_stream = None
+            _pending_cardkit_text = None
+            _cardkit_push_task = None
+            if not is_voice_message:
+                try:
+                    from bridge_core.run_session import RunSession, get_active_run
 
-            if bot_reply_msg_id:
-                if attempt > 1 or is_resumed:
-                    await _feishu_call(
-                        lambda: patch_interactive_card_sdk(bot_reply_msg_id, init_card),
-                        label=f"init-card patch attempt {attempt}"
-                    )
-            else:
+                    existing = get_active_run(chat_id)
+                    existing_ck = (task_meta or {}).get("cardkit_card_id") if task_meta else None
+                    existing_msg = bot_reply_msg_id or ((task_meta or {}).get("bot_reply_msg_id") if task_meta else None)
+                    existing_seq = int((task_meta or {}).get("cardkit_sequence") or 0) if task_meta else 0
+                    existing_run = (task_meta or {}).get("run_id") if task_meta else None
+                    if existing and existing.message_id and (not existing_msg or existing.message_id == existing_msg):
+                        run_session = existing
+                        bot_reply_msg_id = run_session.message_id
+                        cardkit_stream = run_session.card
+                        log.info(f"[Executor] Reusing active RunSession run_id={run_session.run_id}")
+                    elif existing_ck and existing_msg:
+                        run_session = RunSession.attach(
+                            chat_id,
+                            existing_ck,
+                            existing_msg,
+                            sequence=existing_seq,
+                            run_id=existing_run,
+                            user_text=user_text,
+                        )
+                        if run_session:
+                            bot_reply_msg_id = existing_msg
+                            cardkit_stream = run_session.card
+                            log.info(f"[Executor] Attached RunSession card_id={existing_ck}")
+                    elif message_id and str(message_id).startswith("om_"):
+                        run_session = await _feishu_call(
+                            lambda: RunSession.start_as_reply(
+                                chat_id, message_id, user_text=user_text, initial_label="思考中…"
+                            ),
+                            timeout=12.0,
+                            label="run_session start",
+                        )
+                        if run_session:
+                            bot_reply_msg_id = run_session.message_id
+                            cardkit_stream = run_session.card
+                            if task_meta is not None:
+                                task_meta["bot_reply_msg_id"] = bot_reply_msg_id
+                                task_meta["cardkit_card_id"] = run_session.card_id
+                                task_meta["cardkit_sequence"] = getattr(run_session.card, "sequence", 0) or 0
+                                task_meta["run_id"] = run_session.run_id
+                    if run_session:
+                        run_session.process = process
+                        run_session.apply(
+                            {"type": "meta", "userText": user_text, "chatId": chat_id},
+                            push=False,
+                        )
+                        label = "重新执行中…" if (attempt > 1 or is_resumed) else "思考中…"
+                        await _feishu_call(
+                            lambda: run_session.apply(
+                                {"type": "progress", "phase": "thinking", "label": label},
+                                force=True,
+                            ),
+                            timeout=8.0,
+                            label="run_session progress",
+                        )
+                except Exception as e:
+                    log.warning(f"[Executor] RunSession unavailable, legacy path: {e}")
+
+            # 无 RunSession 时才发旧 typing 卡（语音 / CardKit 失败）
+            if not run_session and not bot_reply_msg_id:
+                init_card = CardBuilder.build_typing_indicator(
+                    downloaded_file_name, download_success, user_text, is_voice=is_voice_message
+                )
                 new_id = await _feishu_call(
                     lambda: send_interactive_card_sdk(message_id, init_card),
                     label=f"init-card send attempt {attempt}"
@@ -987,49 +1033,11 @@ async def execute_antigravity(
                     bot_reply_msg_id = new_id
                     if task_meta is not None:
                         task_meta["bot_reply_msg_id"] = new_id
-                        try:
-                            from database import save_pending_task
-                            save_pending_task(chat_id, task_meta)
-                        except Exception:
-                            pass
-                else:
-                    log.warning(f"[Executor] Initial typing card send failed for chat {chat_id}; will fall back to sending final card as new message")
-
-            # CardKit 原生流式：优先续用 pipeline 已发出的占位卡，禁止再发一张后删除旧卡（飞书会显示「撤回」）
-            cardkit_stream = None
-            _pending_cardkit_text = None
-            _cardkit_push_task = None
-            if not is_voice_message:
-                try:
-                    from lark_stream import StreamingMarkdownCard
-
-                    existing_ck = (task_meta or {}).get("cardkit_card_id") if task_meta else None
-                    existing_msg = bot_reply_msg_id or ((task_meta or {}).get("bot_reply_msg_id") if task_meta else None)
-                    existing_seq = int((task_meta or {}).get("cardkit_sequence") or 0) if task_meta else 0
-                    if existing_ck and existing_msg:
-                        cardkit_stream = StreamingMarkdownCard.attach(
-                            existing_ck, existing_msg, sequence=existing_seq
-                        )
-                        bot_reply_msg_id = existing_msg
-                        log.info(f"[Executor] Reusing CardKit placeholder card_id={existing_ck}")
-                    elif message_id and str(message_id).startswith("om_"):
-                        started = await _feishu_call(
-                            lambda: StreamingMarkdownCard.start_as_reply(message_id, "…"),
-                            timeout=12.0,
-                            label="cardkit start",
-                        )
-                        if started and getattr(started, "card_id", None):
-                            cardkit_stream = started
-                            bot_reply_msg_id = cardkit_stream.message_id
-                            if task_meta is not None:
-                                task_meta["bot_reply_msg_id"] = bot_reply_msg_id
-                                task_meta["cardkit_card_id"] = cardkit_stream.card_id
-                                task_meta["cardkit_sequence"] = cardkit_stream.sequence
-                except Exception as e:
-                    log.warning(f"[Executor] CardKit stream unavailable, legacy patch mode: {e}")
 
             async def _flush_cardkit_pushes():
                 nonlocal _cardkit_push_task
+                if run_session:
+                    await _feishu_call(lambda: run_session.flush(), timeout=8.0, label="run_session flush")
                 if _cardkit_push_task is not None:
                     try:
                         await _cardkit_push_task
@@ -1038,8 +1046,11 @@ async def execute_antigravity(
                     _cardkit_push_task = None
 
             def _schedule_cardkit_content(text: str):
-                """非阻塞推送 CardKit 正文（latest-wins）。"""
+                """兼容旧调用：有 RunSession 时改为 set_text 事件。"""
                 nonlocal _pending_cardkit_text, _cardkit_push_task
+                if run_session and not run_session.failed:
+                    run_session.apply({"type": "set_text", "content": text or ""}, push=True)
+                    return
                 if not cardkit_stream or cardkit_stream.failed:
                     return
                 _pending_cardkit_text = text
@@ -1058,6 +1069,13 @@ async def execute_antigravity(
                         )
 
                 _cardkit_push_task = asyncio.create_task(_runner())
+
+            def _schedule_run_push():
+                if run_session and not run_session.failed:
+                    try:
+                        run_session.push()
+                    except Exception:
+                        pass
 
             accumulated_text = ""
             accumulated_thinking = ""
@@ -1204,6 +1222,8 @@ async def execute_antigravity(
                             )
                             if tdelta:
                                 accumulated_thinking += tdelta
+                                if run_session:
+                                    run_session.apply({"type": "thinking", "delta": tdelta}, push=True)
                         elif step_t == "agent_response":
                             delta = step_up.get("text_delta")
                             if delta:
@@ -1212,9 +1232,21 @@ async def execute_antigravity(
                                 if parsed_steps and parsed_steps != planned_steps:
                                     planned_steps = parsed_steps
                                     current_plan_idx = min(current_plan_idx, len(planned_steps) - 1)
+                                if run_session:
+                                    run_session.apply({"type": "text", "delta": delta}, push=True)
                             if current_tool_action:
                                 if current_tool_action not in completed_tool_steps:
                                     completed_tool_steps.append(current_tool_action)
+                                if run_session:
+                                    run_session.apply(
+                                        {
+                                            "type": "tool_result",
+                                            "id": current_tool_action,
+                                            "status": "done",
+                                            "label": current_tool_action,
+                                        },
+                                        push=False,
+                                    )
                                 current_tool_action = ""
                                 stream_action = ""
                                 tool_in_flight_start_time = None
@@ -1231,6 +1263,16 @@ async def execute_antigravity(
                                 if current_tool_action and act != current_tool_action:
                                     if current_tool_action not in completed_tool_steps:
                                         completed_tool_steps.append(current_tool_action)
+                                    if run_session:
+                                        run_session.apply(
+                                            {
+                                                "type": "tool_result",
+                                                "id": current_tool_action,
+                                                "status": "done",
+                                                "label": current_tool_action,
+                                            },
+                                            push=False,
+                                        )
                                 current_tool_action = act
                                 stream_action = act
                                 last_tool_action = act
@@ -1239,6 +1281,17 @@ async def execute_antigravity(
                                 if planned_steps:
                                     current_plan_idx = CardBuilder.match_step_index(
                                         planned_steps, current_plan_idx, act, len(completed_tool_steps)
+                                    )
+                                if run_session:
+                                    run_session.apply(
+                                        {
+                                            "type": "tool_use",
+                                            "id": act,
+                                            "name": t_name or "tool",
+                                            "label": act,
+                                            "input": t_params,
+                                        },
+                                        push=True,
                                     )
                             # Co-Pilot 对高风险工具事件进行语义复核；普通工具由本地规则和 CLI 沙箱保护。
                             ts_tier = getattr(config, "TYPESAFE_TIER", "gateway") or "gateway"
@@ -1368,14 +1421,19 @@ async def execute_antigravity(
                     else:
                         log.error(f"[Executor] Process stalled for chat {chat_id} (stall={stall_seconds}s, limit={effective_stall_timeout}s, hard={effective_stall_hard_timeout}s), closing session...")
                         await sess.close()
-                        error_card = CardBuilder.build_stall_error_card(user_text, think_seconds, stall_seconds)
-                        if bot_reply_msg_id:
+                        stderr_text = f"⚠️ 任务已检测到假死并自动终止（连续 {stall_seconds // 60} 分钟没有任何输出、进程树无任何 CPU 活跃且无任何工具在运行）。"
+                        session_data["last_execution_error"] = True
+                        if run_session:
+                            await _feishu_call(
+                                lambda: run_session.finish_error(stderr_text),
+                                label="stall run_session error",
+                            )
+                        elif bot_reply_msg_id:
+                            error_card = CardBuilder.build_stall_error_card(user_text, think_seconds, stall_seconds)
                             await _feishu_call(
                                 lambda: patch_interactive_card_sdk(bot_reply_msg_id, error_card),
                                 label="stall error card patch"
                             )
-                        stderr_text = f"⚠️ 任务已检测到假死并自动终止（连续 {stall_seconds // 60} 分钟没有任何输出、进程树无任何 CPU 活跃且无任何工具在运行）。"
-                        session_data["last_execution_error"] = True
                         await _flush_cardkit_pushes()
                         await _flush_stream_patches()
                         return {"has_reply": True, "reply_text": stderr_text, "is_error": True}
@@ -1422,12 +1480,29 @@ async def execute_antigravity(
                     else:
                         is_streaming_text = True
 
-                if is_streaming_text:
+                if run_session and not run_session.failed:
+                    # Bridge 主路径：事件已写入 RunState，这里只做心跳/进度刷新
+                    if is_streaming_text:
+                        last_streamed_length = len(clean_partial)
+                        # 用清洗后的 partial 同步正文（避免 TASK_PLAN 等噪音）
+                        run_session.apply({"type": "set_text", "content": clean_partial}, push=True)
+                    elif stall_seconds >= effective_warning_threshold and not is_worker_active and not has_tool_in_flight:
+                        run_session.apply(
+                            {
+                                "type": "progress",
+                                "phase": "thinking",
+                                "label": f"已等待 {stall_seconds}s",
+                                "detail": f"总耗时 {think_seconds}s",
+                            },
+                            push=True,
+                        )
+                    else:
+                        _schedule_run_push()
+                elif is_streaming_text:
                     display_partial = clean_partial
                     last_streamed_length = len(clean_partial)
                     active_action = current_tool_action or stream_action or ""
                     if cardkit_stream and not cardkit_stream.failed:
-                        # 工具进行中时在正文顶部挂一行轻量状态
                         if active_action:
                             from cards.indicators import clean_action_text
                             tip = clean_action_text(active_action)
@@ -1459,7 +1534,6 @@ async def execute_antigravity(
                     active_action = current_tool_action or stream_action
                     display_action = active_action or (last_tool_action if not planned_steps else "")
                     if cardkit_stream and not cardkit_stream.failed:
-                        # CardKit 同一条消息上刷新思考/工具进度（勿再 patch 旧 interactive JSON）
                         from cards.indicators import build_cardkit_progress_markdown
                         _schedule_cardkit_content(
                             build_cardkit_progress_markdown(
@@ -1614,15 +1688,15 @@ async def execute_antigravity(
                 ws_root = session_data.get("workspace_root")
                 allowed_dirs = [active_project, ws_root]
                 
+                from bridge_core.media_out import deliver_outbound_media
                 cleaned = await _feishu_call(
-                    lambda: extract_and_upload_resources(reply_text, message_id, api_client, allowed_dirs, chat_id=chat_id),
+                    lambda: deliver_outbound_media(reply_text, message_id, api_client, allowed_dirs, chat_id=chat_id),
                     timeout=120.0,
-                    label="extract_and_upload_resources"
+                    label="deliver_outbound_media"
                 )
                 # Bridge-like: keep prose on the card; media already sent as native msgs
                 if isinstance(cleaned, str) and cleaned.strip():
-                    reply_text = cleaned
-                
+                    reply_text = cleaned                
                 if os.path.exists(log_file_path):
                     await _sync_conversation_id_from_log(log_file_path)
                 
@@ -1778,12 +1852,11 @@ async def execute_antigravity(
             except Exception as e:
                 log.warning(f"[Executor] reasoning compose failed: {e}")
 
-            # CardKit 终态：整卡替换，保留可折叠思考面板（对齐 bridge）
+            # Bridge 终态：RunSession.finish_done / finish_error（单卡 + 可选 choice 按钮）
             delivered_via_cardkit = False
-            if cardkit_stream and not cardkit_stream.failed and not is_voice_message:
+            if run_session and not run_session.failed and not is_voice_message:
                 try:
                     await _flush_cardkit_pushes()
-                    from lark_stream import build_final_markdown_card_json
                     extra = []
                     if choice_card_data and choice_card_data.get("options"):
                         opts = "\n".join(
@@ -1813,9 +1886,31 @@ async def execute_antigravity(
                             })
                         if btns:
                             extra.append({"tag": "action", "actions": btns})
+                    if is_error:
+                        ok = await _feishu_call(
+                            lambda: run_session.finish_error(reply_text or "执行失败"),
+                            timeout=12.0,
+                            label="run_session finish_error",
+                        )
+                    else:
+                        ok = await _feishu_call(
+                            lambda: run_session.finish_done(
+                                reply_text or "_(空回复)_",
+                                reasoning=reasoning_text or "",
+                                elements_extra=extra or None,
+                            ),
+                            timeout=12.0,
+                            label="run_session finish_done",
+                        )
+                    delivered_via_cardkit = bool(ok)
+                except Exception as e:
+                    log.warning(f"[Executor] RunSession final delivery failed: {e}")
+            elif cardkit_stream and not cardkit_stream.failed and not is_voice_message:
+                try:
+                    await _flush_cardkit_pushes()
+                    from lark_stream import build_final_markdown_card_json
                     final_json = build_final_markdown_card_json(
                         reply_text or "_(空回复)_",
-                        elements_extra=extra or None,
                         reasoning_text=None if is_error else reasoning_text,
                     )
                     ok = await _feishu_call(
@@ -1826,7 +1921,6 @@ async def execute_antigravity(
                     delivered_via_cardkit = bool(ok)
                 except Exception as e:
                     log.warning(f"[Executor] CardKit final delivery failed: {e}")
-
             if not delivered_via_cardkit:
                 try:
                     import importlib
@@ -1878,6 +1972,13 @@ async def execute_antigravity(
                 await turn_stream.aclose()
             if sess_locked and 'sess' in dir() and sess.lock.locked():
                 sess.lock.release()
+            try:
+                from bridge_core.run_session import unregister_active_run
+                rs = locals().get("run_session")
+                if rs is not None:
+                    unregister_active_run(chat_id, getattr(rs, "run_id", None))
+            except Exception:
+                pass
             if os.path.exists(log_file_path):
                 try:
                     await _sync_conversation_id_from_log(log_file_path)

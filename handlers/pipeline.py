@@ -267,35 +267,34 @@ async def _process_single_task(chat_id, task):
         task.get("is_voice_message")
     )
     if not bot_reply_msg_id and not is_resumed:
-        # 优先 CardKit 占位（与后续流式同一条消息，避免再发一张又撤回旧卡）
-        started_cardkit = False
+        # Bridge-like：只发一张 RunSession/CardKit 卡（带 stop），禁止再开旧 typing 卡
+        started_run = False
         if not is_voice_message and message_id and str(message_id).startswith("om_"):
             try:
-                from lark_stream import StreamingMarkdownCard
+                from bridge_core.run_session import RunSession
 
-                from cards.indicators import build_cardkit_progress_markdown
-                early_md = build_cardkit_progress_markdown(
-                    user_text=user_text,
-                    think_seconds=0,
-                    is_voice=is_voice_message,
+                run_sess = await app_state.run_feishu_sync(
+                    loop,
+                    lambda: RunSession.start_as_reply(
+                        chat_id, message_id, user_text=user_text, initial_label="启动中…"
+                    ),
                 )
-                ck = await app_state.run_feishu_sync(
-                    loop, lambda: StreamingMarkdownCard.start_as_reply(message_id, early_md)
-                )
-                if ck and getattr(ck, "card_id", None) and getattr(ck, "message_id", None):
-                    bot_reply_msg_id = ck.message_id
+                if run_sess and run_sess.card_id and run_sess.message_id:
+                    bot_reply_msg_id = run_sess.message_id
                     task["bot_reply_msg_id"] = bot_reply_msg_id
-                    task["cardkit_card_id"] = ck.card_id
-                    task["cardkit_sequence"] = ck.sequence
-                    started_cardkit = True
+                    task["cardkit_card_id"] = run_sess.card_id
+                    task["cardkit_sequence"] = getattr(run_sess.card, "sequence", 0) or 0
+                    task["run_id"] = run_sess.run_id
+                    started_run = True
                     try:
                         save_pending_task(chat_id, task)
                     except Exception:
                         pass
             except Exception as e:
-                log.warning(f"[Pipeline] Early CardKit placeholder failed: {e}")
+                log.warning(f"[Pipeline] Early RunSession CardKit failed: {e}")
 
-        if not started_cardkit:
+        if not started_run:
+            # 语音或 CardKit 不可用时才降级旧 typing 卡
             init_card = CardBuilder.build_typing_indicator(
                 downloaded_file_name, download_success, user_text, is_voice=is_voice_message
             )
@@ -311,7 +310,6 @@ async def _process_single_task(chat_id, task):
                         pass
             except Exception as e:
                 log.warning(f"[Pipeline] Failed to send early typing card for chat {chat_id}: {e}")
-
     # 先预热上一轮的档位，与 Jev 判定并行；若新档位不同，判定后再切到精确档位。
     prewarm_task = None
     prewarmed_model = session_data.get("model", "Default")

@@ -259,6 +259,16 @@ class StreamingMarkdownCard:
             return False
 
 
+def create_card_entity(card_json: dict) -> Optional[str]:
+    """Public alias for CardKit card.create."""
+    return _create_card_entity(card_json)
+
+
+def reply_card_by_ref(message_id: str, card_id: str) -> Optional[str]:
+    """Public alias for reply with card reference."""
+    return _reply_card_by_ref(message_id, card_id)
+
+
 def _create_card_entity(card_json: dict) -> Optional[str]:
     req = (
         CreateCardRequest.builder()
