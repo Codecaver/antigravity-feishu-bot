@@ -64,6 +64,13 @@ def _structure_signature(state: Dict[str, Any], elements_extra: Optional[list] =
     )
 
 
+def _card_has_md_body(card_json: Optional[dict]) -> bool:
+    if not isinstance(card_json, dict):
+        return False
+    elems = (card_json.get("body") or {}).get("elements") or []
+    return any(isinstance(e, dict) and e.get("element_id") == "md_body" for e in elems)
+
+
 class RunSession:
     """One Feishu CardKit card per agent run (bridge-like)."""
 
@@ -135,7 +142,8 @@ class RunSession:
             except Exception:
                 pass
             sess = cls(chat_id, stream, state=state, run_id=run_id)
-            sess._body_ready = True  # render_card(running) 始终带 md_body
+            # 启动卡可能尚无 md_body（避免「…」占位）；有正文后再开 element patch
+            sess._body_ready = _card_has_md_body(render_card(state))
             sess._last_structure_sig = _structure_signature(state)
             register_active_run(chat_id, sess)
             log.info(f"[RunSession] started run_id={run_id} card_id={card_id} msg={msg_id}")
@@ -194,7 +202,11 @@ class RunSession:
             if (not force) and (now - self._last_push_at) < self._content_min_interval:
                 self._dirty = True
                 return True
-            text = sanitize_feishu_markdown(assistant_text(self.state) or "…") or "…"
+            raw = assistant_text(self.state)
+            if not (raw or "").strip():
+                # 尚无正文时不要 patch 成「…」，改走整卡（活动行/工具步骤）
+                return self._push_full(elements_extra=None, sig=sig)
+            text = sanitize_feishu_markdown(raw) or raw
             ok = self.card.set_content(text, force=True)
             if not ok:
                 # element patch 失败（超时等）→ 整卡替换自愈，勿放弃单卡
@@ -231,7 +243,7 @@ class RunSession:
             if not ok:
                 self.failed = True
                 return False
-        self._body_ready = True
+        self._body_ready = _card_has_md_body(card_json)
         self.failed = False
         if sig is not None:
             self._last_structure_sig = sig
