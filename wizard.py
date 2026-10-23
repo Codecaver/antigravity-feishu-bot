@@ -85,14 +85,48 @@ def resolve_feature_addons(feature: str) -> dict[str, Any]:
     return FEATURE_PACKS[key]["addons"]
 
 
+def _qr_url_for_terminal(url: str) -> str:
+    """Strip bulky Web-prefill and addon payloads to produce a truly compact QR code.
+
+    The OAuth device flow only requires `user_code` (+ optional `createOnly`).
+    Stripping `addons` (which contains 200+ bytes of gzip+b64 scopes) and Web presets
+    reduces the QR matrix from 69x69 (35 lines, filling the entire terminal) down to
+    33x33 (only 17 lines, very compact and fast for phones to scan).
+    """
+    from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    compact_query = {}
+    for key in ("user_code", "device_code", "createOnly"):
+        if key in query:
+            compact_query[key] = query[key]
+
+    if not compact_query:
+        compact_query = {
+            k: v
+            for k, v in query.items()
+            if k not in ("name", "desc", "avatar", "addons", "source", "from", "tp")
+        }
+
+    return urlunparse(parsed._replace(query=urlencode(compact_query, doseq=True)))
+
+
 def _print_qr_to_terminal(url: str, expire_in: int) -> None:
+    """Print a small, camera-scannable terminal QR (Hermes-sized)."""
+    scan_url = _qr_url_for_terminal(url)
     print("\n请用飞书 App 扫描以下二维码完成应用创建/授权：\n")
     try:
         import qrcode
 
-        qr = qrcode.QRCode(border=1)
-        qr.add_data(url)
+        qr = qrcode.QRCode(
+            border=1,
+            error_correction=qrcode.constants.ERROR_CORRECT_L,
+        )
+        qr.add_data(scan_url)
         qr.make(fit=True)
+        # Use standard ASCII invert (dark module = black background, light module = terminal foreground)
+        # This preserves correct Position Detection Pattern contrast for phone cameras.
         qr.print_ascii(invert=True)
     except Exception as exc:
         print(f"(终端二维码渲染失败: {exc}，请直接打开下方链接)\n")
@@ -382,7 +416,11 @@ def bootstrap_credentials() -> None:
             file=sys.stderr,
         )
         sys.exit(2)
-    run_setup_wizard(terminal_qr=True)
+    try:
+        run_setup_wizard(terminal_qr=True)
+    except KeyboardInterrupt:
+        print("\n已取消扫码创建。", file=sys.stderr)
+        sys.exit(130)
 
 
 def _cli(argv: Optional[list[str]] = None) -> int:
@@ -399,18 +437,22 @@ def _cli(argv: Optional[list[str]] = None) -> int:
     )
     sub.add_parser("list", help="列出可用能力包")
 
-    args = parser.parse_args(argv)
-    if args.cmd == "list":
-        for key, title, desc in list_feature_packs():
-            print(f"{key:10}  {title}  — {desc}")
-        return 0
-    if args.cmd == "setup":
-        run_setup_wizard()
-        return 0
-    if args.cmd == "grant":
-        run_grant_wizard(args.feature)
-        return 0
-    return 1
+    try:
+        args = parser.parse_args(argv)
+        if args.cmd == "list":
+            for key, title, desc in list_feature_packs():
+                print(f"{key:10}  {title}  — {desc}")
+            return 0
+        if args.cmd == "setup":
+            run_setup_wizard()
+            return 0
+        if args.cmd == "grant":
+            run_grant_wizard(args.feature)
+            return 0
+        return 1
+    except KeyboardInterrupt:
+        print("\n已取消。", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":

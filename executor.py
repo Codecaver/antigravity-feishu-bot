@@ -5,6 +5,7 @@ import json
 import uuid
 import re
 import subprocess
+from typing import Optional
 from config import ANTIGRAVITY_BIN, DANGEROUSLY_SKIP_PERMISSIONS, get_brain_dir, get_transcript_path, BASE_DIR
 import config
 from logger import log
@@ -307,113 +308,78 @@ def _is_process_group_active(pid: int, min_cpu_percent: float = 0.02) -> dict:
     }
 
 def format_tool_action(tool_name: str = "", params: dict = None, raw_action: str = "") -> str:
-    """Format and streamline tool actions to avoid verbose code snippets or multi-line commands."""
+    """Format and streamline tool actions to preserve actionable commands, queries and paths."""
     params = params or {}
     tool_name = (tool_name or "").strip()
 
-    # 1. 优先提取语义化的工具动作说明
-    act = params.get("toolAction") or params.get("toolSummary") or raw_action or ""
-    if isinstance(act, str):
-        act = act.replace('"', '').replace("'", "").strip()
-        act = re.sub(r'[\r\n\t]+', ' ', act).strip()
-        act = re.sub(r'\s+', ' ', act)
-        act = CardBuilder.translate_action_verb(act)
-    else:
-        act = ""
-
-    # 如果有明确简短的描述且不是底层代码/命令
-    if act and not any(act.startswith(p) for p in ["python", "timeout", "sh", "bash", "cat", "echo", "export"]):
-        action_verbs = ["连接", "下载", "检查", "分析", "生成", "写入", "查看", "搜索", "读取", "编辑", "查询", "汇总", "获取", "上传", "发送", "整理", "运行", "执行"]
-        if len(act) <= 25:
-            if act.startswith("正在"):
-                return act
-            if any(act.startswith(v) for v in action_verbs):
-                return f"正在{act}"
-            return f"正在执行 {act}"
-        brief = act[:22] + "..."
-        if brief.startswith("正在"):
-            return brief
-        if any(brief.startswith(v) for v in action_verbs):
-            return f"正在{brief}"
-        return f"正在执行 {brief}"
-
-    # 2. 针对 run_command 提取精炼用途，严禁直接展示多行代码
-    cmd = (params.get("CommandLine") or params.get("command") or "").strip()
-    if tool_name == "run_command" or cmd:
+    # 1. 终端执行命令 (run_command) - 保留具体命令
+    cmd = (params.get("CommandLine") or params.get("command") or params.get("cmd") or "").strip()
+    if tool_name in ("run_command", "execute_command", "terminal", "bash") or cmd:
         clean_cmd = re.sub(r'^timeout\s+\d+\s+', '', cmd).strip()
         clean_cmd = re.sub(r'[\r\n\t]+', ' ', clean_cmd).strip(' "\'`')
         clean_cmd = re.sub(r'\s+', ' ', clean_cmd)
+        if clean_cmd:
+            brief = (clean_cmd[:68] + "…") if len(clean_cmd) > 70 else clean_cmd
+            return f"执行命令: `{brief}`"
+        return "执行终端命令"
 
-        if not clean_cmd:
-            return "正在执行终端命令"
-        first = clean_cmd.split()[0] if clean_cmd else ""
-        if first in ("python", "python3"):
-            if "sqlite3" in clean_cmd or "db" in clean_cmd:
-                return "正在查询本地数据库"
-            return "正在执行 Python 脚本"
-        elif first in ("docker", "docker-compose"):
-            return "正在查询 Docker 容器"
-        elif first == "git":
-            return "正在执行 Git 操作"
-        elif first in ("grep", "rg"):
-            return "正在检索文件内容"
-        elif first in ("find", "fd", "ls"):
-            return "正在查找系统文件"
-        elif first in ("curl", "wget"):
-            return "正在请求网络数据"
-        else:
-            brief = clean_cmd[:18] + "..." if len(clean_cmd) > 20 else clean_cmd
-            return f"正在运行命令: {brief}"
+    # 2. 联网搜索 (search_web) - 保留搜索关键词
+    if tool_name in ("search_web", "web_search", "google_search"):
+        q = (params.get("Query") or params.get("query") or params.get("q") or params.get("search_query") or "").strip(' "\'`')
+        q = re.sub(r'[\r\n\t]+', ' ', q)
+        if q:
+            brief = (q[:42] + "…") if len(q) > 45 else q
+            return f"联网搜索: `{brief}`"
+        return "联网搜索资料"
 
-    # 3. 针对常用文件与交互工具
-    if tool_name == "view_file":
-        path = params.get("AbsolutePath") or params.get("path") or ""
-        fname = os.path.basename(path.strip(' "\'')) if path else ""
-        return f"正在读取文件: {fname}" if fname else "正在读取文件"
-    elif tool_name in ("write_to_file", "replace_file_content"):
-        path = params.get("TargetFile") or params.get("path") or ""
-        fname = os.path.basename(path.strip(' "\'')) if path else ""
-        return f"正在编辑文件: {fname}" if fname else "正在修改文件"
-    elif tool_name == "grep_search":
-        q = (params.get("Query") or "").strip(' "\'')
-        q = re.sub(r'[\r\n\t]+', ' ', q)[:12]
-        return f"正在搜索代码: {q}" if q else "正在搜索代码"
-    elif tool_name == "find_by_name":
-        p = (params.get("Pattern") or "").strip(' "\'')
-        p = re.sub(r'[\r\n\t]+', ' ', p)[:12]
-        return f"正在查找文件: {p}" if p else "正在查找文件"
-    elif tool_name == "list_dir":
-        return "正在浏览目录结构"
-    elif tool_name == "search_web":
-        return "正在联网搜索资料"
-    elif tool_name == "read_url_content":
-        return "正在抓取网页内容"
-    elif tool_name == "invoke_subagent":
-        return "正在调度子智能体"
-    elif tool_name == "manage_task":
-        return "正在管理后台任务"
+    # 3. 抓取网页内容 (read_url_content) - 保留网址路径
+    if tool_name in ("read_url_content", "fetch_web_page", "browse_url"):
+        u = (params.get("Url") or params.get("url") or "").strip(' "\'`')
+        if u:
+            u_clean = re.sub(r'^https?://(www\.)?', '', u)
+            brief = (u_clean[:45] + "…") if len(u_clean) > 48 else u_clean
+            return f"抓取网页: `{brief}`"
+        return "抓取网页内容"
 
-    # 工具名中文映射兜底
-    TOOL_MAP = {
-        "run_command": "执行终端命令",
-        "view_file": "读取文件",
-        "write_to_file": "写入文件",
-        "replace_file_content": "编辑文件",
-        "grep_search": "搜索代码",
-        "find_by_name": "查找文件",
-        "list_dir": "浏览目录",
-        "search_web": "联网搜索",
-        "read_url_content": "抓取网页",
-        "manage_task": "管理任务",
-        "invoke_subagent": "调度智能体",
-    }
-    if tool_name in TOOL_MAP:
-        return f"正在{TOOL_MAP[tool_name]}"
+    # 4. 文件读写与检索 - 保留具体文件名或路径
+    if tool_name in ("view_file", "read_file"):
+        path = (params.get("AbsolutePath") or params.get("path") or params.get("file_path") or "").strip(' "\'')
+        fname = os.path.basename(path) if path else ""
+        return f"读取文件: `{fname}`" if fname else "读取文件"
 
-    if act:
-        return f"正在执行 {act[:20]}..." if len(act) > 22 else f"正在执行 {act}"
+    if tool_name in ("write_to_file", "replace_file_content", "edit_file"):
+        path = (params.get("TargetFile") or params.get("path") or params.get("file_path") or "").strip(' "\'')
+        fname = os.path.basename(path) if path else ""
+        return f"编辑文件: `{fname}`" if fname else "修改文件"
 
-    return "正在执行操作"
+    if tool_name in ("grep_search", "search_code"):
+        q = (params.get("Query") or params.get("query") or params.get("pattern") or "").strip(' "\'')
+        q = re.sub(r'[\r\n\t]+', ' ', q)[:25]
+        return f"搜索代码: `{q}`" if q else "搜索代码"
+
+    if tool_name in ("find_by_name", "find_file"):
+        p = (params.get("Pattern") or params.get("pattern") or "").strip(' "\'')
+        p = re.sub(r'[\r\n\t]+', ' ', p)[:25]
+        return f"查找文件: `{p}`" if p else "查找文件"
+
+    if tool_name == "list_dir":
+        p = (params.get("DirectoryPath") or params.get("path") or "").strip(' "\'')
+        fname = os.path.basename(p.rstrip('/')) if p else ""
+        return f"浏览目录: `{fname}`" if fname else "浏览目录结构"
+
+    if tool_name == "invoke_subagent":
+        return "调度子智能体"
+    if tool_name == "manage_task":
+        return "管理后台任务"
+
+    # 5. 显式 toolAction / toolSummary 兜底
+    act = params.get("toolAction") or params.get("toolSummary") or raw_action or ""
+    if isinstance(act, str) and act.strip():
+        act_clean = re.sub(r'[\r\n\t]+', ' ', act).strip()
+        brief = (act_clean[:38] + "…") if len(act_clean) > 40 else act_clean
+        return f"执行操作: {brief}"
+
+    return f"执行工具: {tool_name}" if tool_name else "执行操作"
 
 async def _stream_typewriter_to_feishu(bot_reply_msg_id, full_text, user_text, think_seconds, feishu_call_fn, start_index=0, completed_steps_count=0, total_planned_steps=0, is_voice=False):
     """把尚未流式刷出的尾巴补到卡片上；文本用细粒度增量，避免 1500 字一整批跳变。"""
@@ -654,31 +620,22 @@ def extract_thinking_content(text: str) -> str:
 
 
 def build_process_narrative(planned_steps=None, completed_steps=None) -> str:
-    """把任务规划/已执行工具整理成可读过程（对齐 bridge 的过程可见性）。"""
-    from cards.indicators import clean_action_text
-
-    planned_steps = planned_steps or []
+    """把已执行的具体命令与工具调用整理成清晰可查的过程清单。"""
     completed_steps = completed_steps or []
+    if not completed_steps and planned_steps:
+        return "\n".join(f"{i + 1}. ⏳ {step}" for i, step in enumerate(planned_steps)).strip()
+
     lines = []
-    if planned_steps:
-        for i, step in enumerate(planned_steps):
-            done = i < len(completed_steps)
-            mark = "✅" if done else "⏳"
-            lines.append(f"{i + 1}. {mark} {step}")
-        # 额外完成的工具（超出规划）
-        if len(completed_steps) > len(planned_steps):
-            for step in completed_steps[len(planned_steps) :]:
-                tip = clean_action_text(step) or step
-                lines.append(f"- ✅ {tip}")
-    else:
-        for i, step in enumerate(completed_steps, 1):
-            tip = clean_action_text(step) or step
-            lines.append(f"{i}. ✅ {tip}")
+    for i, step in enumerate(completed_steps, 1):
+        clean_step = str(step).strip()
+        if clean_step.startswith("正在"):
+            clean_step = clean_step[2:]
+        lines.append(f"{i}. ✅ {clean_step}")
     return "\n".join(lines).strip()
 
 
 def compose_reasoning_panel_body(raw_text: str, planned_steps=None, completed_steps=None, max_chars: int = 6000) -> str:
-    """合并思考原文 + 执行过程，供最终卡片保留。"""
+    """合并思考原文 + 执行的具体命令过程，供最终折叠卡片保留查看。"""
     thinking = extract_thinking_content(raw_text or "")
     process = build_process_narrative(planned_steps, completed_steps)
     # 无标签思考时：用最终答复之前的前言作为软思考（去掉 TASK_PLAN / 标签残留）
@@ -705,7 +662,7 @@ def compose_reasoning_panel_body(raw_text: str, planned_steps=None, completed_st
     if thinking:
         parts.append(thinking)
     if process:
-        parts.append("**执行过程**\n" + process)
+        parts.append("**执行过程与命令**\n" + process)
     body = "\n\n".join(parts).strip()
     if len(body) > max_chars:
         body = body[: max_chars - 20] + "\n\n_(思考内容过长已截断)_"
@@ -816,6 +773,91 @@ def extract_choice_card_data(reply_text, transcript_path=None, initial_transcrip
 
     return reply_text, None
 
+async def send_independent_final_reply(
+    message_id: str,
+    reply_text: str,
+    choice_card_data: Optional[dict] = None,
+    session_data: Optional[dict] = None,
+    _feishu_call=None,
+) -> bool:
+    """以独立消息的形式发送最终回复（将过程与结果拆分成两条独立消息）。"""
+    if not reply_text or not str(reply_text).strip():
+        return False
+
+    # 1. 尝试使用 CardKit 2.0 现代卡片
+    try:
+        from lark_stream import build_final_markdown_card_json, create_card_entity, reply_card_by_ref
+
+        extra = []
+        if choice_card_data and choice_card_data.get("options"):
+            opts = "\n".join(
+                f"{i}. {o}" for i, o in enumerate(choice_card_data["options"][:10], 1)
+            )
+            q = choice_card_data.get("question") or "请选择"
+            extra.append({"tag": "hr"})
+            extra.append({
+                "tag": "markdown",
+                "content": f"**{q}**\n\n{opts}\n\n_(点击下方按钮或直接回复选项)_",
+            })
+            btns = []
+            for opt in choice_card_data["options"][:6]:
+                label = (opt[:20] + "…") if len(opt) > 20 else opt
+                btns.append({
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": label},
+                    "type": "default",
+                    "behaviors": [{
+                        "type": "callback",
+                        "value": {
+                            "action": "user_choice",
+                            "choice": opt,
+                            "label": label,
+                        },
+                    }],
+                })
+            extra.extend(btns)
+
+        final_json = build_final_markdown_card_json(
+            reply_text,
+            elements_extra=extra or None,
+            reasoning_text=None,  # 思考过程已在上一条独立卡片中，本条不再重复
+            user_text=None,        # 独立消息不再重复引用用户问题，保持干净
+        )
+
+        card_id = await _feishu_call(lambda: create_card_entity(final_json), label="create final cardkit")
+        if card_id:
+            msg_id = await _feishu_call(lambda: reply_card_by_ref(message_id, card_id), label="reply final cardkit")
+            if msg_id:
+                return True
+    except Exception as e:
+        log.warning(f"[Executor] send CardKit final reply failed: {e}")
+
+    # 2. 降级：标准交互卡片
+    try:
+        from card_builder import CardBuilder
+        from lark_client import send_interactive_card_sdk
+        card = CardBuilder.build_ai_response(
+            reply_text,
+            choice_card_data=choice_card_data,
+            session_data=session_data,
+            reasoning_text=None,
+        )
+        msg_id = await _feishu_call(lambda: send_interactive_card_sdk(message_id, card), label="fallback card send")
+        if msg_id:
+            return True
+    except Exception as e:
+        log.warning(f"[Executor] fallback interactive card failed: {e}")
+
+    # 3. 兜底：纯文本回复
+    try:
+        from lark_client import send_reply_sdk
+        await _feishu_call(lambda: send_reply_sdk(message_id, reply_text), label="fallback text send")
+        return True
+    except Exception as e:
+        log.error(f"[Executor] all final reply sends failed: {e}")
+        return False
+
+
 async def execute_antigravity(
     chat_id, user_text, message_id, bot_reply_msg_id, session_data, 
     is_new_conversation, system_instruction, final_prompt, downloaded_file_name, 
@@ -856,7 +898,6 @@ async def execute_antigravity(
             return None
     
     async def _sync_conversation_id_from_log(log_path):
-        """从 antigravity 日志中解析 conversation ID 并同步落盘到 session_data。"""
         nonlocal target_transcript_path
         if not os.path.exists(log_path):
             return
@@ -1495,6 +1536,27 @@ async def execute_antigravity(
                         cp = re.sub(r'^\s*\[TASK_PLAN\][^\n]*(?:\n|$)', '', cp, flags=re.IGNORECASE).strip()
                         clean_partial = cp.strip()
 
+                # 实时提取正在输出的思考内容（支持未闭合的 <thinking> 标签）
+                clean_thinking = ""
+                is_thinking_closed = False
+                if accumulated_text:
+                    match_th = re.search(
+                        r'<(?:thinking|thought|think)>(.*?)(?:</(?:thinking|thought|think)>|\Z)',
+                        accumulated_text,
+                        re.DOTALL | re.IGNORECASE,
+                    )
+                    if match_th:
+                        raw_th = match_th.group(1).strip()
+                        raw_th = re.sub(r'\[TASK_PLAN\].*?\[/TASK_PLAN\]\s*', '', raw_th, flags=re.DOTALL | re.IGNORECASE)
+                        raw_th = re.sub(r'^\s*\[TASK_PLAN\][^\n]*(?:\n|$)', '', raw_th, flags=re.IGNORECASE)
+                        clean_thinking = raw_th.strip()
+                        if re.search(r'</(?:thinking|thought|think)>', accumulated_text, re.IGNORECASE):
+                            is_thinking_closed = True
+                elif accumulated_thinking:
+                    clean_thinking = accumulated_thinking.strip()
+
+                is_thinking_active = bool(clean_thinking and not is_thinking_closed and not clean_partial)
+
                 has_tool_in_flight = bool(current_tool_action or stream_action)
 
                 # 流式策略（对齐 lark-agent-bridge / Cursor）：
@@ -1516,11 +1578,20 @@ async def execute_antigravity(
                         is_streaming_text = True
 
                 if run_session and not run_session.failed:
-                    # Bridge 主路径：事件已写入 RunState，这里只做心跳/进度刷新
+                    # 1. 实时同步思考过程（若在思考中，卡片展开并流式滚动思考文字）
+                    if clean_thinking:
+                        run_session.apply(
+                            {"type": "set_thinking", "content": clean_thinking, "active": is_thinking_active},
+                            push=False,
+                        )
+
+                    # 2. 区分正文流式 / 纯思考流式 / 状态心跳
                     if is_streaming_text:
                         last_streamed_length = len(clean_partial)
                         # 用清洗后的 partial 同步正文（避免 TASK_PLAN 等噪音）
                         run_session.apply({"type": "set_text", "content": clean_partial}, push=True)
+                    elif is_thinking_active:
+                        _schedule_run_push()
                     elif stall_seconds >= effective_warning_threshold and not is_worker_active and not has_tool_in_flight:
                         run_session.apply(
                             {
@@ -1955,15 +2026,27 @@ async def execute_antigravity(
                                 label="run_session finish_error",
                             )
                         else:
+                            # 双消息架构：第一条收口为过程卡（思考面板+执行命令），第二条新发最终答复
+                            has_meaningful_process = bool(reasoning_text and reasoning_text.strip()) or bool(completed_tool_steps)
+                            process_summary = "_✅ 思考与步骤已完成，回复请见下方独立消息。_" if has_meaningful_process else "_✅ 处理完成_"
                             ok = await _feishu_call(
                                 lambda: run_session.finish_done(
-                                    reply_text or "_(空回复)_",
+                                    process_summary,
                                     reasoning=reasoning_text or "",
-                                    elements_extra=extra or None,
+                                    elements_extra=None,
                                 ),
                                 timeout=12.0,
                                 label="run_session finish_done",
                             )
+                            # 独立发送最终答复卡片
+                            if reply_text and not output_blocked:
+                                await send_independent_final_reply(
+                                    message_id,
+                                    reply_text,
+                                    choice_card_data=choice_card_data,
+                                    session_data=session_data,
+                                    _feishu_call=_feishu_call,
+                                )
                         delivered_via_cardkit = bool(ok)
                         if not ok and run_session.card_id:
                             # 再试一次 CardKit 终态卡，禁止掉进 V1 patch
@@ -1986,8 +2069,10 @@ async def execute_antigravity(
                 try:
                     await _flush_cardkit_pushes()
                     from lark_stream import build_final_markdown_card_json
+                    has_meaningful_process = bool(reasoning_text and reasoning_text.strip()) or bool(completed_tool_steps)
+                    process_summary = "_✅ 思考与步骤已完成，回复请见下方独立消息。_" if has_meaningful_process else "_✅ 处理完成_"
                     final_json = build_final_markdown_card_json(
-                        reply_text or "_(空回复)_",
+                        process_summary,
                         reasoning_text=None if is_error else reasoning_text,
                         user_text=user_text,
                     )
@@ -1998,6 +2083,14 @@ async def execute_antigravity(
                         label="cardkit final replace",
                     )
                     delivered_via_cardkit = bool(ok)
+                    if not is_error and reply_text and not output_blocked:
+                        await send_independent_final_reply(
+                            message_id,
+                            reply_text,
+                            choice_card_data=choice_card_data,
+                            session_data=session_data,
+                            _feishu_call=_feishu_call,
+                        )
                 except Exception as e:
                     log.warning(f"[Executor] CardKit final delivery failed: {e}")
             if not delivered_via_cardkit:

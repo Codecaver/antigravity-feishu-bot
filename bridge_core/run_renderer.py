@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 
 from utils.feishu_markdown import format_user_quote, sanitize_feishu_markdown
 
-REASONING_MAX = 1500
+REASONING_MAX = 5000
 COLLAPSE_TOOL_THRESHOLD = 3
 
 
@@ -40,16 +40,18 @@ def render_card(state: Dict[str, Any], elements_extra: Optional[List[dict]] = No
         else:
             elements.extend(_render_tool_group(group.get("tools") or [], finalized=terminal != "running"))
 
-    # 运行中始终保留 md_body，便于后续只 patch 正文（打字机）而不整卡替换
+    # 运行中：若非思考中，保留 md_body 占位便于后续 patch；思考中时不塞无意义省略号
     if terminal == "running" and not body_added:
-        elements.append(
-            {
-                "tag": "markdown",
-                "element_id": "md_body",
-                "content": "…",
-            }
-        )
-        body_added = True
+        is_thinking = bool(reasoning.get("active") and reasoning.get("content"))
+        if not is_thinking:
+            elements.append(
+                {
+                    "tag": "markdown",
+                    "element_id": "md_body",
+                    "content": "…",
+                }
+            )
+            body_added = True
 
     # choice / 额外按钮放在「已完成」之前
     if elements_extra:
@@ -62,8 +64,7 @@ def render_card(state: Dict[str, Any], elements_extra: Optional[List[dict]] = No
         elements.append(_note(f"⚠️ {msg}"))
     elif terminal == "done":
         if not body_added:
-            elements.append(_note("_（未返回内容）_"))
-        elements.append(_note("_✅ 已完成_"))
+            elements.append(_note("_✅ 思考与步骤已完成_"))
 
     if terminal == "running":
         activity = _activity_text(state)
@@ -130,10 +131,16 @@ def _reasoning_panel(content: str, active: bool) -> dict:
     if len(body) > REASONING_MAX:
         body = body[: REASONING_MAX - 1] + "…"
     body = body or "_（无详细思考内容）_"
-    title = "🧠 **思考中**" if active else "🧠 **思考完成，点击查看**"
+    if active:
+        title = "🧠 **思考中…**"
+        display_body = body + " ▌"
+    else:
+        title = "🧠 **思考完成，点击查看**"
+        display_body = body
+
     return {
         "tag": "collapsible_panel",
-        "expanded": bool(active and len(body) < 400),
+        "expanded": bool(active),
         "header": {
             "title": {"tag": "markdown", "content": title},
             "vertical_align": "center",
@@ -148,7 +155,7 @@ def _reasoning_panel(content: str, active: bool) -> dict:
         "border": {"color": "grey", "corner_radius": "5px"},
         "vertical_spacing": "8px",
         "padding": "8px 8px 8px 8px",
-        "elements": [{"tag": "markdown", "content": body, "text_size": "notation"}],
+        "elements": [{"tag": "markdown", "content": display_body, "text_size": "notation"}],
     }
 
 
@@ -172,9 +179,8 @@ def _render_tool_group(tools: List[dict], finalized: bool) -> List[dict]:
     if len(tools) < COLLAPSE_TOOL_THRESHOLD:
         return [_tool_panel(t) for t in tools]
     if finalized:
-        names = "、".join((t.get("label") or t.get("name") or "tool")[:40] for t in tools[:8])
-        more = f" 等 {len(tools)} 步" if len(tools) > 8 else f"（{len(tools)} 步）"
-        return [_note(f"🛠️ 已执行工具 {more}：{names}")]
+        # 终态时所有命令与步骤已完整收拢进「思考完成，点击查看」折叠面板中，外部不再冗余平铺
+        return []
     prior = tools[:-1]
     latest = tools[-1]
     out: List[dict] = []

@@ -25,14 +25,10 @@ async def _process_image_message(loop, message_id, content_json, content_raw):
     if image_key:
         os.makedirs(DOWNLOADS_DIR, exist_ok=True)
         output_filename = os.path.join(DOWNLOADS_DIR, f"img_{image_key}.jpg")
-        
-        dl_card = CardBuilder.build_download_indicator(os.path.basename(output_filename), "图片")
-        bot_reply_msg_id = await loop.run_in_executor(None, lambda: send_interactive_card_sdk(message_id, dl_card))
-        
         output_path = os.path.abspath(output_filename)
         success = await loop.run_in_executor(None, lambda: download_message_resource_sdk(message_id, image_key, "image", output_path))
         
-        return f"请查看这张图片并做出回应。图片路径: {output_path}", os.path.basename(output_filename), success, bot_reply_msg_id
+        return f"请查看这张图片并做出回应。图片路径: {output_path}", os.path.basename(output_filename), success, None
     else:
         return "[未获取到图片]", None, True, None
 
@@ -56,17 +52,13 @@ async def _process_post_message(loop, message_id, content_json):
         image_key = image_keys[0]
         os.makedirs(DOWNLOADS_DIR, exist_ok=True)
         output_filename = os.path.join(DOWNLOADS_DIR, f"img_{image_key}.jpg")
-        
-        dl_card = CardBuilder.build_download_indicator("图片内容")
-        bot_reply_msg_id = await loop.run_in_executor(None, lambda: send_interactive_card_sdk(message_id, dl_card))
-        
         output_path = os.path.abspath(output_filename)
         download_success = await loop.run_in_executor(None, lambda: download_message_resource_sdk(message_id, image_key, "image", output_path))
         
         downloaded_file_name = os.path.basename(output_filename)
         user_text += f"\n[附加图片路径: {output_path}]"
         
-    return user_text, downloaded_file_name, download_success, bot_reply_msg_id
+    return user_text, downloaded_file_name, download_success, None
 
 
 async def _process_link_message(content_json):
@@ -104,12 +96,6 @@ async def _process_file_audio_media_message(loop, message_id, message_type, cont
         
         os.makedirs(DOWNLOADS_DIR, exist_ok=True)
         output_filename = os.path.join(DOWNLOADS_DIR, file_name)
-        if message_type == "audio":
-            init_card = CardBuilder.build_typing_indicator(is_voice=True)
-        else:
-            init_card = CardBuilder.build_download_indicator(file_name, message_type)
-        bot_reply_msg_id = await loop.run_in_executor(None, lambda: send_interactive_card_sdk(message_id, init_card))
-
         output_path = os.path.abspath(output_filename)
         download_success = await loop.run_in_executor(None, lambda: download_message_resource_sdk(message_id, file_key, "file", output_path))
         downloaded_file_name = file_name
@@ -139,17 +125,13 @@ async def _process_file_audio_media_message(loop, message_id, message_type, cont
         elif message_type == "media":
             user_text = f"请仔细观看这段视频内容（视频文件路径: {output_path}），并做出响应。"
             
-    return user_text, downloaded_file_name, download_success, bot_reply_msg_id
+    return user_text, downloaded_file_name, download_success, None
 
 
 async def _process_batch_media_message(loop, message_id, content_json):
     items = content_json.get("items", [])
     media_hints = []
     download_success = True
-    
-    # 批量下发资源加载指示器
-    dl_card = CardBuilder.build_download_indicator(f"合并批处理 ({len(items)} 个文件)", "多媒体组")
-    bot_reply_msg_id = await loop.run_in_executor(None, lambda: send_interactive_card_sdk(message_id, dl_card))
     
     os.makedirs(DOWNLOADS_DIR, exist_ok=True)
     
@@ -183,5 +165,5 @@ async def _process_batch_media_message(loop, message_id, content_json):
                 
     user_text = f"请查看以下 {len(items)} 个关联多模态文件并做出综合关联回应：\n\n" + "\n".join(media_hints)
     downloaded_file_name = f"合并批处理 ({len(items)} 个文件)"
-    return user_text, downloaded_file_name, download_success, bot_reply_msg_id
+    return user_text, downloaded_file_name, download_success, None
 

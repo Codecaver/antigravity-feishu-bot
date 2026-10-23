@@ -84,6 +84,64 @@ def format_user_quote(user_text: str, max_chars: int = 280) -> str:
     return f"> {text}"
 
 
+def _format_table_for_feishu(table_str: str) -> str:
+    """Transform GFM markdown tables into elegant Feishu-friendly structured layouts."""
+    lines = [l.strip() for l in table_str.strip().split('\n') if l.strip()]
+    if len(lines) < 2:
+        return table_str
+
+    def _parse_row(row_line: str) -> list[str]:
+        raw = row_line.strip()
+        if raw.startswith('|'):
+            raw = raw[1:]
+        if raw.endswith('|'):
+            raw = raw[:-1]
+        return [c.strip() for c in raw.split('|')]
+
+    headers = _parse_row(lines[0])
+    data_rows = []
+    for line in lines[1:]:
+        if re.match(r'^[\|\s\-:]+$', line):
+            continue
+        cols = _parse_row(line)
+        while len(cols) < len(headers):
+            cols.append('')
+        data_rows.append(cols[:len(headers)])
+
+    if not data_rows:
+        return table_str
+
+    out_lines = []
+    num_cols = len(headers)
+
+    for cols in data_rows:
+        primary = cols[0]
+        if num_cols == 2:
+            h2, v2 = headers[1], cols[1]
+            if v2:
+                out_lines.append(f"• **{primary}**：{v2}")
+            else:
+                out_lines.append(f"• **{primary}**")
+        elif num_cols == 3:
+            pairs = []
+            for h, v in zip(headers[1:], cols[1:]):
+                if v:
+                    pairs.append(f"**{h}**: {v}")
+            detail = " ｜ ".join(pairs)
+            if detail:
+                out_lines.append(f"• **{primary}** ({detail})")
+            else:
+                out_lines.append(f"• **{primary}**")
+        else:
+            # 4 columns or more: expand to item with sub-bullets
+            out_lines.append(f"• **{primary}**")
+            for h, v in zip(headers[1:], cols[1:]):
+                if v:
+                    out_lines.append(f"  - **{h}**：{v}")
+
+    return "\n" + "\n".join(out_lines) + "\n"
+
+
 def _sanitize_prose(text: str) -> str:
     """Sanitize non-code markdown for Feishu cards — preserve rich structure."""
 
@@ -122,14 +180,13 @@ def _sanitize_prose(text: str) -> str:
     out = _BARE_FILE_URL.sub(lambda m: f"`{_pretty_path(m.group(1))}`", out)
     out = _BARE_ABS_PATH.sub(lambda m: f"`{_pretty_path(m.group(1))}`", out)
 
-    # Keep ATX headings (# / ## / ###). CardKit 2.0 renders them better as bold+size cues;
-    # use bold for h1/h2 visual weight while preserving a blank line after.
+    # Keep ATX headings (# / ## / ###). CardKit 2.0 renders them better as bold cues with clear paragraph breaks.
     def _heading_sub(m: re.Match) -> str:
         level = len(m.group(1))
         title = (m.group(2) or "").strip()
         if level <= 2:
-            return f"**{title}**\n"
-        return f"**{title}**"
+            return f"\n\n**{title}**\n"
+        return f"\n\n**{title}**\n"
 
     out = re.sub(r"^(#{1,6})\s+(.+)$", _heading_sub, out, flags=re.MULTILINE)
 
@@ -138,9 +195,10 @@ def _sanitize_prose(text: str) -> str:
     # Only convert list-marker star at line start (`* item`), not italic `*word*`
     out = re.sub(r"^\*\s+", "- ", out, flags=re.MULTILINE)
 
-    # Restore tables
+    # Restore and convert tables into elegant Feishu-friendly layouts
     for i, table in enumerate(tables):
-        out = out.replace(f"@@TABLE{i}@@", table.strip("\n"))
+        formatted_table = _format_table_for_feishu(table)
+        out = out.replace(f"@@TABLE{i}@@", formatted_table)
 
     return out
 

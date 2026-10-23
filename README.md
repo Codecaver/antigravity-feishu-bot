@@ -111,6 +111,45 @@
 - **Python 3.10+**
 - **Node.js & PM2**（用于生产环境高可用守护：`npm install -g pm2`）
 - 本机已安装并完成登录认证的 **Antigravity CLI**（`agy` 或 `antigravity`）
+- 交互式扫码创建应用需 **TTY 终端**（SSH / 本机终端均可；Docker 无 TTY 时请手动写 `.env`）
+
+---
+
+### 📱 扫码创建飞书机器人（推荐）
+
+无需先去开放平台手工建应用：用官方 `lark_oapi.register_app` 设备码流程，在终端打出二维码，**用飞书 App 扫码**即可创建企业自建应用，并把凭据写入 `.env`。
+
+**前置：** 已安装依赖（至少含 `lark-oapi>=1.7.4` 与 `qrcode`），且当前目录为项目根目录。
+
+```bash
+# 激活虚拟环境后执行
+python wizard.py setup
+```
+
+终端会打印可扫描的二维码（也可打开同屏给出的链接）。扫码并在飞书确认后：
+
+- `FEISHU_APP_ID` / `FEISHU_APP_SECRET` 自动写入 `.env`
+- 扫码用户的 `open_id` 会写入 `ALLOWED_USERS`（便于首批放行）
+- 预申请 **基础消息** 能力包（收发消息、资源、卡片回调、`cardkit:card:write` 等）
+
+**缺凭据时自动进入向导：** 在交互式终端直接启动 `python main.py`（或 PM2 前台调试），若 `.env` 中尚无 App ID/Secret，会自动调用同一套扫码流程。非 TTY（如纯 Docker 后台）无法扫码，需先在宿主机执行 `python wizard.py setup`，或手动填写 `.env`。
+
+**扫码成功后仍建议到开放平台核对并发布：**
+
+1. **事件与回调** → 接收方式选 **WebSocket 长连接**（勿填公网 URL）
+2. 确认事件 `im.message.receive_v1`、回调 `card.action.trigger`
+3. **版本管理与发布** → 创建版本并发布；**可用范围**包含你自己
+
+**增量能力包（可选）：** 已有应用后，可再扫码追加权限：
+
+```bash
+python wizard.py list              # 查看能力包：base / reaction / chat / drive
+python wizard.py grant reaction    # 例：消息表情
+python wizard.py grant chat        # 例：群聊管理
+python wizard.py grant drive       # 例：云文档
+```
+
+> 国际版租户（Lark）会自动切到 `larksuite.com`；按 `Ctrl+C` 可取消扫码等待。
 
 ---
 
@@ -122,12 +161,17 @@
 bash <(curl -sL https://raw.githubusercontent.com/Level6me/antigravity-feishu-bot/main/install.sh)
 ```
 
-脚本将自动引导您输入飞书 `FEISHU_APP_ID` 和 `FEISHU_APP_SECRET`，并自动构建虚拟环境、安装依赖与启动 PM2 守护进程。
+脚本会构建虚拟环境、安装依赖，并在配置飞书凭据时提供二选一：
+
+1. **扫码创建飞书应用**（推荐，调用 `python wizard.py setup`）
+2. **手动输入**已有 `FEISHU_APP_ID` / `FEISHU_APP_SECRET`
+
+随后自动用 PM2 守护启动。
 
 **本地已 Clone 代码时的一键运维：**
 ```bash
 chmod +x install.sh
-./install.sh           # 安装与初始化
+./install.sh           # 安装与初始化（含扫码/手填凭据）
 ./install.sh update    # 极速拉取并平滑重启
 ./install.sh uninstall # 彻底清理后台服务与环境
 ```
@@ -148,9 +192,12 @@ source venv/bin/activate
 # 3. 安装依赖包
 pip install -r requirements.txt
 
-# 4. 配置环境变量
+# 4. 配置飞书凭据（二选一）
+#    A. 扫码创建（推荐）
+python wizard.py setup
+#    B. 手动填写已有应用
 cp .env.example .env
-nano .env  # 填入飞书凭证，按需配置 TYPESAFE_API_KEY
+nano .env   # 填入 FEISHU_APP_ID / FEISHU_APP_SECRET，按需配置 TYPESAFE_API_KEY
 
 # 5. 使用 PM2 启动服务（推荐）
 pm2 start venv/bin/python3 --name "feishu-bot" -- main.py
@@ -162,9 +209,13 @@ pm2 startup
 
 ### 方法 3：Docker / Docker Compose 部署
 
+容器内通常无交互式 TTY，**请先在宿主机扫码或手填凭据**，再挂载 `.env` 启动：
+
 ```bash
-cp .env.example .env
-# 编辑 .env 配置飞书凭据与挂载目录
+# 宿主机（项目目录）
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+python wizard.py setup   # 或 cp .env.example .env 后手填
 
 docker compose up -d --build
 ```
@@ -177,7 +228,7 @@ docker compose up -d --build
 
 ```env
 # ==========================================
-# 1. 飞书开放平台配置 (必填)
+# 1. 飞书开放平台配置 (必填；也可用 python wizard.py setup 扫码写入)
 # ==========================================
 FEISHU_APP_ID=cli_xxxxxxxxxxxx
 FEISHU_APP_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
@@ -231,24 +282,27 @@ GITEE_MIRROR_URL=
 
 ---
 
-## 📋 飞书开放平台后台配置（极简 4 步）
+## 📋 飞书开放平台后台配置（核对清单）
+
+若已用 `python wizard.py setup` 扫码创建，下列权限/事件/回调多数已在确认页预填；仍建议登录 [飞书开放平台](https://open.feishu.cn/)（国际版：[Lark Open Platform](https://open.larksuite.com/)）核对后**发布版本**。纯手建应用则按下列项逐项配置。
 
 1. **开启 WebSocket 长连接模式**：
-   - 登录 [飞书开放平台](https://open.feishu.cn/)，进入创建的企业自建应用。
-   - 打开 **开发配置 → 事件与回调**（或“事件订阅”），将接收方式切换为 **WebSocket 长连接**（无需填写公网 URL）。
-2. **开通必要权限（权限管理）**：
-   - `im:message`（获取与发送单聊、群组消息）
-   - `im:message:resource`（获取消息中的图片、富文本与音视频资源）
-   - `im:image`（上传图片）
-   - `im:file`（上传本地文件与生成物）
-   - `im:message.reaction`（消息表情回复状态标记）
-   - `im:chat:readonly`（读取群聊名称）
-   - `contact:user.base:readonly`（读取用户飞书昵称）
-3. **订阅核心事件**：
-   - 添加事件：`im.message.receive_v1`（接收消息事件）
-   - 卡片动作回调：`card.action.trigger`（自动支持，无需额外权限）
+   - 进入企业自建应用 → **开发配置 → 事件与回调**（或“事件订阅”）
+   - 接收方式选 **WebSocket 长连接**（无需公网 URL / Webhook）
+2. **基础权限（对应能力包 `base`，扫码默认申请）**：
+   - `im:message` / `im:message:send_as_bot` / `im:message:readonly`
+   - `im:resource` / `im:image` / `im:file`
+   - `im:chat:readonly`、`contact:user.base:readonly`
+   - `cardkit:card:write`（CardKit 2.0 流式卡片）
+3. **订阅事件与回调**：
+   - 事件：`im.message.receive_v1`
+   - 回调：`card.action.trigger`
 4. **发布应用版本**：
-   - 确认并在 **版本管理与发布** 中创建新版本并发布，确保你的飞书账号位于应用的**可用范围**内。
+   - **版本管理与发布** → 创建版本并发布；**可用范围**包含你自己（及需要使用的同事/群）
+5. **可选增量能力**（`python wizard.py grant <包名>`）：
+   - `reaction`：消息表情读写与事件
+   - `chat`：群聊管理 `im:chat`
+   - `drive`：云文档与评论 @bot 事件
 
 ---
 

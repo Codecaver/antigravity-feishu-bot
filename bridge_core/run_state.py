@@ -91,6 +91,16 @@ def reduce(state: Dict[str, Any], evt: Dict[str, Any]) -> Dict[str, Any]:
             activity={"kind": "phase", "phase": "thinking"},
         )
 
+    if et == "set_thinking":
+        content = evt.get("content") or ""
+        active = evt.get("active", True)
+        return _touch(
+            state,
+            reasoning={"content": content, "active": active},
+            footer="thinking" if active else state.get("footer"),
+            activity={"kind": "phase", "phase": "thinking"} if active else state.get("activity"),
+        )
+
     if et == "progress":
         phase = evt.get("phase") or state.get("footer") or "thinking"
         return _touch(
