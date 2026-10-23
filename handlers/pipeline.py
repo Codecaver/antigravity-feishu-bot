@@ -267,22 +267,49 @@ async def _process_single_task(chat_id, task):
         task.get("is_voice_message")
     )
     if not bot_reply_msg_id and not is_resumed:
-        init_card = CardBuilder.build_typing_indicator(
-            downloaded_file_name, download_success, user_text, is_voice=is_voice_message
-        )
-        try:
-            bot_reply_msg_id = await app_state.run_feishu_sync(
-                loop, lambda: send_interactive_card_sdk(message_id, init_card)
-            )
-            if bot_reply_msg_id:
-                task["bot_reply_msg_id"] = bot_reply_msg_id
-                try:
-                    save_pending_task(chat_id, task)
-                except Exception:
-                    pass
-        except Exception as e:
-            log.warning(f"[Pipeline] Failed to send early typing card for chat {chat_id}: {e}")
+        # Bridge-like：只发一张 RunSession/CardKit 卡（带 stop），禁止再开旧 typing 卡
+        started_run = False
+        if not is_voice_message and message_id and str(message_id).startswith("om_"):
+            try:
+                from bridge_core.run_session import RunSession
 
+                run_sess = await app_state.run_feishu_sync(
+                    loop,
+                    lambda: RunSession.start_as_reply(
+                        chat_id, message_id, user_text=user_text, initial_label="启动中…"
+                    ),
+                )
+                if run_sess and run_sess.card_id and run_sess.message_id:
+                    bot_reply_msg_id = run_sess.message_id
+                    task["bot_reply_msg_id"] = bot_reply_msg_id
+                    task["cardkit_card_id"] = run_sess.card_id
+                    task["cardkit_sequence"] = getattr(run_sess.card, "sequence", 0) or 0
+                    task["run_id"] = run_sess.run_id
+                    started_run = True
+                    try:
+                        save_pending_task(chat_id, task)
+                    except Exception:
+                        pass
+            except Exception as e:
+                log.warning(f"[Pipeline] Early RunSession CardKit failed: {e}")
+
+        if not started_run:
+            # 语音或 CardKit 不可用时才降级旧 typing 卡
+            init_card = CardBuilder.build_typing_indicator(
+                downloaded_file_name, download_success, user_text, is_voice=is_voice_message
+            )
+            try:
+                bot_reply_msg_id = await app_state.run_feishu_sync(
+                    loop, lambda: send_interactive_card_sdk(message_id, init_card)
+                )
+                if bot_reply_msg_id:
+                    task["bot_reply_msg_id"] = bot_reply_msg_id
+                    try:
+                        save_pending_task(chat_id, task)
+                    except Exception:
+                        pass
+            except Exception as e:
+                log.warning(f"[Pipeline] Failed to send early typing card for chat {chat_id}: {e}")
     # 先预热上一轮的档位，与 Jev 判定并行；若新档位不同，判定后再切到精确档位。
     prewarm_task = None
     prewarmed_model = session_data.get("model", "Default")
@@ -317,17 +344,23 @@ async def _process_single_task(chat_id, task):
     # 纯语义判定自适应思考层级（基于 System One 对上下文与待办任务的认知评估）
     adaptive_tier = evaluate_adaptive_tier(decision)
 
+    from config import DEFAULT_MODEL
+    # 未手动 /model 切换时，跟随 .env DEFAULT_MODEL，避免旧会话卡在 3.7 而配置已是 3.8
+    if session_data.get("model_user_override"):
+        base_model = session_data.get("base_model") or DEFAULT_MODEL
+    else:
+        base_model = DEFAULT_MODEL
     if adaptive_tier:
         session_data["typesafe_adaptive_tier"] = adaptive_tier
-        base_model = session_data.get("base_model") or session_data.get("model", "")
         session_data["base_model"] = base_model
         session_data["model"] = resolve_adaptive_model(base_model, adaptive_tier)
         session_data["reasoning_effort"] = adaptive_tier.lower()
     else:
         session_data.pop("typesafe_adaptive_tier", None)
-        if "base_model" in session_data:
-            session_data["model"] = session_data["base_model"]
+        session_data["base_model"] = base_model
+        session_data["model"] = base_model
         session_data["reasoning_effort"] = "medium"
+    await save_session_async(chat_id, session_data)
 
     selected_model = session_data.get("model", "Default")
     selected_effort = session_data.get("reasoning_effort", "medium")
@@ -351,14 +384,41 @@ async def _process_single_task(chat_id, task):
 
     session_data["bot_reply_msg_id"] = bot_reply_msg_id
 
+    async def _finalize_early_card(card_json_or_v1: dict, *, as_v2_markdown: str = "") -> None:
+        """早起若是 CardKit V2，禁止 message.patch(V1)；改为 card.update 或新发。"""
+        ck_id = task.get("cardkit_card_id")
+        if ck_id and bot_reply_msg_id:
+            try:
+                from lark_stream import StreamingMarkdownCard, build_final_markdown_card_json
+                from bridge_core.run_session import get_active_run, unregister_active_run
+
+                body = as_v2_markdown or "_（已处理）_"
+                final = build_final_markdown_card_json(body, user_text=user_text)
+                seq = int(task.get("cardkit_sequence") or 0)
+                stream = StreamingMarkdownCard.attach(ck_id, bot_reply_msg_id, sequence=seq)
+                if stream:
+                    stream.failed = False
+                    ok = await app_state.run_feishu_sync(loop, lambda: stream.replace_with_card(final))
+                    if ok:
+                        rs = get_active_run(chat_id)
+                        if rs:
+                            unregister_active_run(chat_id, getattr(rs, "run_id", None))
+                        return
+            except Exception as e:
+                log.warning(f"[Pipeline] CardKit finalize failed, fallback send: {e}")
+        if bot_reply_msg_id and not task.get("cardkit_card_id"):
+            await app_state.run_feishu_sync(loop, lambda: patch_interactive_card_sdk(bot_reply_msg_id, card_json_or_v1))
+        else:
+            await loop.run_in_executor(None, lambda: send_interactive_card_sdk(message_id, card_json_or_v1))
+
     # 1. 安全沙箱门禁拦截（基于 TypeSafe Noul 概率评判与置信度兜底）
     if decision.is_dangerous:
         log.warning(f"[Security] Intercepted dangerous request: '{user_text}' (prob={decision.danger_prob:.2f})")
         warn_card = CardBuilder.build_security_warning(user_text)
-        if bot_reply_msg_id:
-            await app_state.run_feishu_sync(loop, lambda: patch_interactive_card_sdk(bot_reply_msg_id, warn_card))
-        else:
-            await loop.run_in_executor(None, lambda: send_interactive_card_sdk(message_id, warn_card))
+        warn_md = (
+            f"🛡️ **安全拦截**\n\n检测到高风险请求，已阻止执行。\n\n> {user_text[:200]}"
+        )
+        await _finalize_early_card(warn_card, as_v2_markdown=warn_md)
         return
 
     # 2. 插件极速直达通道 (Fast-Path / 零模型冷启动延迟)
@@ -375,7 +435,14 @@ async def _process_single_task(chat_id, task):
             test_result=res,
             tier=cfg.get("tier")
         )
-        if bot_reply_msg_id:
+        # TypeSafe 配置卡仍是交互 V1 结构：有 CardKit 占位时先收口占位，再发配置卡
+        if task.get("cardkit_card_id"):
+            await _finalize_early_card(
+                ts_card,
+                as_v2_markdown="⚙️ TypeSafe 配置面板已另发（见下一条）。",
+            )
+            await loop.run_in_executor(None, lambda: send_interactive_card_sdk(message_id, ts_card))
+        elif bot_reply_msg_id:
             await app_state.run_feishu_sync(loop, lambda: patch_interactive_card_sdk(bot_reply_msg_id, ts_card))
         else:
             await loop.run_in_executor(None, lambda: send_interactive_card_sdk(message_id, ts_card))
@@ -484,9 +551,9 @@ async def _process_single_task(chat_id, task):
         system_instruction = (
             "[System Rule: MUST ALWAYS communicate, reply, explain, and write responses in Simplified Chinese (简体中文). "
             "Any English text in the response must be limited to code syntax or technical names only. "
-            "Absolute directive: NEVER output internal chain-of-thought, reasoning steps, planning commentary, or English preambles. "
-            "Output ONLY your final answer directly in Simplified Chinese.]\n\n"
+            "最终对用户可见的正文用简体中文直接回答；如需短暂推理，请放在 <thinking>...</thinking> 中，系统会单独折叠展示。]\n\n"
             "[Role: A friendly, concise and warm AI assistant. Reply naturally and warmly in 1-2 natural sentences without calling tools or explaining technical rules.]\n\n"
+            "[Feishu Style] 可用 `## 标题`、**粗体**、表格与 `1.` 列表；禁止 file://；路径用反引号短路径。\n\n"
             "[System One Adaptive Reasoning: LOW]\n"
             "当前任务判定为轻量日常问答或闲聊，请以极简快速思考直接给出精炼回答，避免冗长思考与过度分析。\n\n"
         )
@@ -499,14 +566,22 @@ async def _process_single_task(chat_id, task):
         system_instruction = (
             "[System Rule: MUST ALWAYS communicate, reply, explain, and write responses in Simplified Chinese (简体中文). "
             "Any English text in the response must be limited to code syntax or technical names only. "
-            "Absolute directive: NEVER output internal chain-of-thought, reasoning steps, planning commentary, or English preambles. "
-            "Output ONLY your final answer directly in Simplified Chinese.]\n\n"
+            "最终答复正文用简体中文直接给出；推理/排查过程请包在 <thinking>...</thinking> 标签内（可中英混合），"
+            "系统会在飞书卡片中以「思考完成，点击查看」折叠面板保留展示，勿把长推理堆进正文。]\n\n"
         )
 
         system_instruction += (
-            "[System Feishu Resource Delivery / 飞书文件传送规范]\n"
-            "1. 【统一使用飞书官方推送】：向用户提供文件时，请在最终回复中直接以标准 Markdown 链接输出该文件的本地绝对路径（例如 `[导出报告.xlsx](/path/to/file.xlsx)` 或 `📄 [文档.md](/path/to/doc.md)`），系统后台会自动拦截该路径并调用飞书官方 API 原生推送到当前会话供用户点击下载。严禁在脚本中私自 curl/webhook 传文件。\n"
-            "2. 【命令行主动发送】：在终端脚本中如需主动传送文件，可直接运行 `python3 send_to_feishu.py <文件路径>`。\n\n"
+            "[System Feishu Reply Style / 飞书消息排版规范]\n"
+            "回复会显示在飞书 CardKit 卡片中，请主动使用丰富 Markdown，接近正式技术回复：\n"
+            "1. 用 `## 小节标题` 分段；重点用 **粗体**；补充说明可用 *斜体*。\n"
+            "2. 并列要点用有序 `1. 2. 3.` 或无序 `- `；对比或多维信息优先使用清晰的结构化列表（如 `• **主项**（**属性1**: 值1 ｜ **属性2**: 值2）`）呈现，避免输出飞书客户端不支持的原始竖线表格。\n"
+            "3. 代码必须用标准围栏（语言标记单独成行），例如：\n"
+            "```python\nprint('hi')\n```\n"
+            "严禁把多行代码塞进单行反引号。\n"
+            "4. 【禁止】`file://` / HTML；路径用反引号短路径，如 `cards/indicators.py`。\n"
+            "5. 【生成图片】只写 `![简短说明](本地图片完整路径)`，**禁止**再调 `send_to_feishu.py`。\n"
+            "6. 【生成文件】xlsx/pdf/docx 等只写 `[文件名](本地完整路径)`，由系统投递一次；"
+            "**禁止**再调 `send_to_feishu.py`，也禁止同一文件既 markdown 链接又手动推送。\n\n"
         )
 
         if task.get("message_type") == "audio" or task.get("is_voice_message"):
@@ -588,6 +663,16 @@ async def _process_single_task(chat_id, task):
                 "[System One Adaptive Reasoning: MEDIUM]\n"
                 "当前任务判定为常规工程开发，兼顾思考深度与响应效率。\n\n"
             )
+
+        # 卡片脚注用的就是这次 CLI --model；禁止模型自称其它版本号
+        actual_model = session_data.get("model") or DEFAULT_MODEL
+        system_instruction += (
+            "[Runtime Model — authoritative]\n"
+            f"- This turn's CLI model id is exactly: `{actual_model}`\n"
+            "- When asked what model you are / which model is running, answer with this exact id "
+            "(and its human-readable family, e.g. Gemini 3.8 Flash if the id contains 3.8). "
+            "Do not invent a different version number.\n\n"
+        )
     
     # Load long-term memory if this is a new conversation (engineering/task mode only)
     final_prompt = user_text
@@ -604,6 +689,10 @@ async def _process_single_task(chat_id, task):
         import sys, importlib
         if "config" in sys.modules:
             importlib.reload(sys.modules["config"])
+        if "cards.common" in sys.modules:
+            importlib.reload(sys.modules["cards.common"])
+        if "cards.response" in sys.modules:
+            importlib.reload(sys.modules["cards.response"])
         if "cards.indicators" in sys.modules:
             importlib.reload(sys.modules["cards.indicators"])
         if "cards" in sys.modules:

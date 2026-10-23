@@ -530,6 +530,45 @@ def build_download_indicator(file_name, media_type="文件"):
     }
 
 
+def build_cardkit_progress_markdown(
+    user_text="",
+    think_seconds=0,
+    tool_action=None,
+    completed_steps=None,
+    planned_steps=None,
+    is_voice=False,
+):
+    """CardKit 占位阶段可见的思考/工具进度（最终回复前展示）。"""
+    if is_voice:
+        title = "🎙️ 正在生成语音回复..."
+        content = "AI 正在组织语言并为您合成语音回复，请稍候..."
+    else:
+        title, content = _guess_intent(user_text)
+    content = _get_dynamic_think_text(content, think_seconds)
+
+    lines = [f"**{title}**", "", content]
+
+    completed_steps = completed_steps or []
+    if planned_steps:
+        lines.append("")
+        lines.append("**任务步骤**")
+        for i, step in enumerate(planned_steps[:8]):
+            mark = "✅" if i < len(completed_steps) else ("▶️" if i == len(completed_steps) else "⏳")
+            lines.append(f"{i + 1}. {mark} {step}")
+    elif completed_steps:
+        lines.append("")
+        lines.append("**已完成**")
+        for step in completed_steps[-4:]:
+            lines.append(f"- ✅ {clean_action_text(step) or step}")
+
+    if tool_action:
+        tip = clean_action_text(tool_action) or tool_action
+        lines.append("")
+        lines.append(f"*🛠️ 正在执行：{tip}*")
+
+    return "\n".join(lines).strip()
+
+
 def build_streaming_indicator(
     partial_text,
     tool_action=None,
@@ -538,31 +577,41 @@ def build_streaming_indicator(
     completed_steps_count=0,
     total_planned_steps=0,
 ):
-    title, _ = _guess_intent(user_text)
-    header_title = f"⚡ 打字机生成中 | {title}"
-    if len(header_title) > 28:
-        header_title = header_title[:25] + "..."
-    
-    status_bar = f"*( ⏱️ 已耗时 {think_seconds}s"
-    if total_planned_steps > 0:
-        status_bar += f" | ✅ 全套 {total_planned_steps} 个任务规划步骤已全部完成"
-    elif completed_steps_count > 0:
-        status_bar += f" | ✅ 已完成 {completed_steps_count} 个步骤"
-    elif tool_action:
+    # 对齐 lark-agent-bridge：流式阶段只刷正文 + 光标，少状态栏噪音，更丝滑
+    header_title = "✨ AI 回复中..."
+    if tool_action:
         action_disp = clean_action_text(tool_action)
-        status_bar += f" | 🛠️ {action_disp}"
-    status_bar += " )*\n\n---\n\n"
-    
-    # Trim to last 3500 chars if ultra-long to keep card patch within safe payload limit
-    max_streaming_chars = 3500
-    display_text = partial_text
+        if action_disp:
+            header_title = f"🛠️ {action_disp}"
+            if len(header_title) > 28:
+                header_title = header_title[:25] + "..."
+
+    from utils.feishu_markdown import sanitize_feishu_markdown
+
+    # Trim to last 6000 chars if ultra-long to keep card patch within safe payload limit
+    max_streaming_chars = 6000
+    display_text = sanitize_feishu_markdown(partial_text or "")
     if len(display_text) > max_streaming_chars:
         display_text = "... (前文已自动隐藏) ...\n\n" + display_text[-max_streaming_chars:]
-        
-    full_content = status_bar + display_text + " ▌"
-    
+
+    meta_bits = []
+    if completed_steps_count > 0:
+        meta_bits.append(f"✅ {completed_steps_count} 步")
+    if total_planned_steps > 0:
+        meta_bits.append(f"📋 {total_planned_steps}")
+    if think_seconds and think_seconds >= 3:
+        meta_bits.append(f"{think_seconds}s")
+    prefix = ""
+    if meta_bits:
+        prefix = f"*{' · '.join(meta_bits)}*\n\n"
+
+    full_content = prefix + display_text + " ▌"
+
     return {
-        "config": {"wide_screen_mode": True},
+        "config": {
+            "wide_screen_mode": True,
+            "update_multi": True,
+        },
         "header": {
             "template": "blue",
             "title": {"content": header_title, "tag": "plain_text"}
@@ -571,8 +620,7 @@ def build_streaming_indicator(
             {
                 "tag": "markdown",
                 "content": full_content
-            },
-            create_footer()
+            }
         ]
     }
 

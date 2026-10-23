@@ -64,26 +64,17 @@ async def send_card_to_feishu(chat_id: str, card_dict: dict) -> bool:
         except Exception:
             pass
 
-    if not lark_client or not target_chat:
-        logger.info(f"[DryRun] Would send card to chat_id={target_chat}: {json.dumps(card_dict, ensure_ascii=False)[:100]}...")
+    if not target_chat:
+        logger.info(f"[DryRun] Would send card (no chat): {json.dumps(card_dict, ensure_ascii=False)[:100]}...")
         return True
 
+    # 必须走主项目 lark_client，才会做去顶栏等卡片样式规范化
     try:
-        import lark_oapi
-        req = lark_oapi.api.im.v1.CreateMessageRequest.builder() \
-            .receive_id_type("chat_id") \
-            .request_body(
-                lark_oapi.api.im.v1.CreateMessageRequestBody.builder()
-                .receive_id(target_chat)
-                .msg_type("interactive")
-                .content(json.dumps(card_dict))
-                .build()
-            ).build()
-        
+        from lark_client import send_card_to_chat_sdk
         loop = asyncio.get_running_loop()
-        resp = await loop.run_in_executor(None, lambda: lark_client.im.v1.message.create(req))
-        if not resp.success():
-            logger.error(f"Failed to send Feishu message: code={resp.code}, msg={resp.msg}")
+        ok = await loop.run_in_executor(None, lambda: send_card_to_chat_sdk(target_chat, card_dict))
+        if not ok:
+            logger.error("Failed to send Feishu card via send_card_to_chat_sdk")
             return False
         return True
     except Exception as e:

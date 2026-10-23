@@ -1,27 +1,46 @@
 """Card builders: response."""
 
-import os
 import re
-from datetime import datetime
-from utils import get_context_usage_stats
 from utils.quota import is_quota_error
-
-from cards.common import create_footer
+from utils.feishu_markdown import sanitize_feishu_markdown
 
 # 飞书卡片/消息体有 ~30KB 上限，markdown 字段预留安全余量
 MAX_MARKDOWN_CHARS = 25000
 TRUNCATION_NOTICE = "\n\n_(回复过长已截断，完整内容请在工作区查看)_"
 
-def build_ai_response(reply_text, choice_card_data=None, current_model="Default", current_project="默认", is_error=False, is_streaming=False, session_data=None, is_quota=None):
+def build_ai_response(
+    reply_text,
+    choice_card_data=None,
+    current_model="Default",
+    current_project="默认",
+    is_error=False,
+    is_streaming=False,
+    session_data=None,
+    is_quota=None,
+    reasoning_text=None,
+):
+    """最终 AI 回复卡：可含思考过程 + 正文；不渲染模型/项目/S1 注脚。"""
     elements = []
-    
+
+    # 0. Thinking / process (legacy interactive schema：用折叠文案近似)
+    if reasoning_text and str(reasoning_text).strip() and not is_error:
+        reason = sanitize_feishu_markdown(str(reasoning_text).strip())
+        if len(reason) > 4000:
+            reason = reason[:3980] + "\n\n_(思考内容过长已截断)_"
+        elements.append({
+            "tag": "markdown",
+            "content": f"**🧠 思考过程**\n\n{reason}",
+        })
+        elements.append({"tag": "hr"})
+
     # 1. Main Text
     if reply_text:
-        content = reply_text
+        content = sanitize_feishu_markdown(reply_text)
         if len(content) > MAX_MARKDOWN_CHARS:
             content = content[:MAX_MARKDOWN_CHARS] + TRUNCATION_NOTICE
         if is_streaming:
-            content += " ⏳" # Blinking cursor effect
+            content += " ▌"
+
         elements.append({
             "tag": "markdown",
             "content": content
@@ -86,48 +105,6 @@ def build_ai_response(reply_text, choice_card_data=None, current_model="Default"
             "actions": actions
         })
 
-    # 3. Context Info Row
-    if not is_error:
-        project_name_only = "默认"
-        if current_project and current_project not in ["默认", "Default"]:
-            project_name_only = os.path.basename(current_project) or current_project
-        else:
-            project_name_only = current_project or "默认"
-            
-        from utils import get_context_usage_stats
-        stats = get_context_usage_stats(session_data)
-        
-        def format_k(num):
-            if num >= 1000000:
-                return f"{num / 1000000:.1f}M"
-            elif num >= 1000:
-                return f"{num / 1000:.1f}K"
-            return str(num)
-
-        raw_free_pct = stats.get("free_pct", 100.0)
-        total_tokens = stats.get("total_tokens", 0)
-        free_tokens = stats.get("free_tokens", 1000000)
-        max_tokens = stats.get("max_tokens", 1000000)
-
-        if total_tokens == 0 or raw_free_pct >= 100.0:
-            free_pct_str = "100.0"
-        elif raw_free_pct >= 99.9:
-            free_pct_str = f"{raw_free_pct:.2f}" if raw_free_pct < 99.99 else "99.99"
-        else:
-            free_pct_str = f"{raw_free_pct:.1f}"
-
-        context_str = f"🧠 上下文剩余: {free_pct_str}% ({format_k(free_tokens)}/{format_k(max_tokens)})"
-
-        ts_summary = session_data.get("typesafe_audit_summary") if session_data else None
-        meta_parts = [f"🤖 模型: {current_model}", f"🗂️ 项目: {project_name_only}", context_str]
-        if ts_summary:
-            meta_parts.append(ts_summary)
-
-        elements.append({
-            "tag": "markdown",
-            "content": f"<font color='grey'>{' | '.join(meta_parts)}</font>"
-        })
-
     # 4. Quota Actions
     if is_quota is None:
         is_quota = is_error and is_quota_error(reply_text)
@@ -154,9 +131,6 @@ def build_ai_response(reply_text, choice_card_data=None, current_model="Default"
             ]
         })
 
-    # 5. Standard Footer
-    elements.append(create_footer())
-
     if is_quota:
         header_template = "orange"
         header_title = "⚠️ 模型额度已用尽"
@@ -171,7 +145,11 @@ def build_ai_response(reply_text, choice_card_data=None, current_model="Default"
         header_title = "✨ AI 回复"
 
     return {
-        "config": {"wide_screen_mode": True},
+        "config": {
+            "wide_screen_mode": True,
+            "enable_forward": True,
+            "update_multi": True
+        },
         "header": {
             "template": header_template,
             "title": {"content": header_title, "tag": "plain_text"}

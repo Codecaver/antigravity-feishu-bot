@@ -5,12 +5,12 @@ import json
 import uuid
 import re
 import subprocess
+from typing import Optional
 from config import ANTIGRAVITY_BIN, DANGEROUSLY_SKIP_PERMISSIONS, get_brain_dir, get_transcript_path, BASE_DIR
 import config
 from logger import log
 from card_builder import CardBuilder
 from lark_client import patch_interactive_card_sdk, send_interactive_card_sdk, api_client
-from multimodal import extract_and_upload_resources
 from database import save_session_async
 import stats
 import app_state
@@ -93,8 +93,16 @@ def _get_process_tree_status(root_pid: int) -> dict:
             "sleeping_count": 0, "deadlock_suspect": False
         }
     try:
+        # Darwin 的 ps 不支持 wchan:20，整列失败会导致进程树检测全盘降级
+        import sys
+        if sys.platform == "darwin":
+            ps_fmt = "pid,ppid,state,comm,cputime,args"
+            has_wchan = False
+        else:
+            ps_fmt = "pid,ppid,state,wchan:20,comm,cputime,args"
+            has_wchan = True
         out = subprocess.check_output(
-            ["ps", "-eo", "pid,ppid,state,wchan:20,comm,cputime,args"],
+            ["ps", "-eo", ps_fmt],
             text=True, timeout=3
         ).strip()
         
@@ -102,16 +110,25 @@ def _get_process_tree_status(root_pid: int) -> dict:
         proc_info_map = {}
         
         for line in out.splitlines()[1:]:
-            parts = line.split(None, 6)
-            if len(parts) >= 6:
+            # darwin: pid ppid state comm cputime args
+            # linux:  pid ppid state wchan comm cputime args
+            parts = line.split(None, 5 if not has_wchan else 6)
+            need = 5 if not has_wchan else 6
+            if len(parts) >= need:
                 try:
                     p = int(parts[0])
                     pp = int(parts[1])
                     state = parts[2]
-                    wchan = parts[3]
-                    c = parts[4]
-                    t = _parse_cputime(parts[5])
-                    raw_args = parts[6] if len(parts) > 6 else c
+                    if has_wchan:
+                        wchan = parts[3]
+                        c = parts[4]
+                        t = _parse_cputime(parts[5])
+                        raw_args = parts[6] if len(parts) > 6 else c
+                    else:
+                        wchan = "-"
+                        c = parts[3]
+                        t = _parse_cputime(parts[4])
+                        raw_args = parts[5] if len(parts) > 5 else c
                     children_map.setdefault(pp, []).append(p)
                     proc_info_map[p] = {
                         "pid": p, "ppid": pp, "state": state, "wchan": wchan,
@@ -291,156 +308,112 @@ def _is_process_group_active(pid: int, min_cpu_percent: float = 0.02) -> dict:
     }
 
 def format_tool_action(tool_name: str = "", params: dict = None, raw_action: str = "") -> str:
-    """Format and streamline tool actions to avoid verbose code snippets or multi-line commands."""
+    """Format and streamline tool actions to preserve actionable commands, queries and paths."""
     params = params or {}
     tool_name = (tool_name or "").strip()
 
-    # 1. 优先提取语义化的工具动作说明
-    act = params.get("toolAction") or params.get("toolSummary") or raw_action or ""
-    if isinstance(act, str):
-        act = act.replace('"', '').replace("'", "").strip()
-        act = re.sub(r'[\r\n\t]+', ' ', act).strip()
-        act = re.sub(r'\s+', ' ', act)
-        act = CardBuilder.translate_action_verb(act)
-    else:
-        act = ""
-
-    # 如果有明确简短的描述且不是底层代码/命令
-    if act and not any(act.startswith(p) for p in ["python", "timeout", "sh", "bash", "cat", "echo", "export"]):
-        action_verbs = ["连接", "下载", "检查", "分析", "生成", "写入", "查看", "搜索", "读取", "编辑", "查询", "汇总", "获取", "上传", "发送", "整理", "运行", "执行"]
-        if len(act) <= 25:
-            if act.startswith("正在"):
-                return act
-            if any(act.startswith(v) for v in action_verbs):
-                return f"正在{act}"
-            return f"正在执行 {act}"
-        brief = act[:22] + "..."
-        if brief.startswith("正在"):
-            return brief
-        if any(brief.startswith(v) for v in action_verbs):
-            return f"正在{brief}"
-        return f"正在执行 {brief}"
-
-    # 2. 针对 run_command 提取精炼用途，严禁直接展示多行代码
-    cmd = (params.get("CommandLine") or params.get("command") or "").strip()
-    if tool_name == "run_command" or cmd:
+    # 1. 终端执行命令 (run_command) - 保留具体命令
+    cmd = (params.get("CommandLine") or params.get("command") or params.get("cmd") or "").strip()
+    if tool_name in ("run_command", "execute_command", "terminal", "bash") or cmd:
         clean_cmd = re.sub(r'^timeout\s+\d+\s+', '', cmd).strip()
         clean_cmd = re.sub(r'[\r\n\t]+', ' ', clean_cmd).strip(' "\'`')
         clean_cmd = re.sub(r'\s+', ' ', clean_cmd)
+        if clean_cmd:
+            brief = (clean_cmd[:68] + "…") if len(clean_cmd) > 70 else clean_cmd
+            return f"执行命令: `{brief}`"
+        return "执行终端命令"
 
-        if not clean_cmd:
-            return "正在执行终端命令"
-        first = clean_cmd.split()[0] if clean_cmd else ""
-        if first in ("python", "python3"):
-            if "sqlite3" in clean_cmd or "db" in clean_cmd:
-                return "正在查询本地数据库"
-            return "正在执行 Python 脚本"
-        elif first in ("docker", "docker-compose"):
-            return "正在查询 Docker 容器"
-        elif first == "git":
-            return "正在执行 Git 操作"
-        elif first in ("grep", "rg"):
-            return "正在检索文件内容"
-        elif first in ("find", "fd", "ls"):
-            return "正在查找系统文件"
-        elif first in ("curl", "wget"):
-            return "正在请求网络数据"
-        else:
-            brief = clean_cmd[:18] + "..." if len(clean_cmd) > 20 else clean_cmd
-            return f"正在运行命令: {brief}"
+    # 2. 联网搜索 (search_web) - 保留搜索关键词
+    if tool_name in ("search_web", "web_search", "google_search"):
+        q = (params.get("Query") or params.get("query") or params.get("q") or params.get("search_query") or "").strip(' "\'`')
+        q = re.sub(r'[\r\n\t]+', ' ', q)
+        if q:
+            brief = (q[:42] + "…") if len(q) > 45 else q
+            return f"联网搜索: `{brief}`"
+        return "联网搜索资料"
 
-    # 3. 针对常用文件与交互工具
-    if tool_name == "view_file":
-        path = params.get("AbsolutePath") or params.get("path") or ""
-        fname = os.path.basename(path.strip(' "\'')) if path else ""
-        return f"正在读取文件: {fname}" if fname else "正在读取文件"
-    elif tool_name in ("write_to_file", "replace_file_content"):
-        path = params.get("TargetFile") or params.get("path") or ""
-        fname = os.path.basename(path.strip(' "\'')) if path else ""
-        return f"正在编辑文件: {fname}" if fname else "正在修改文件"
-    elif tool_name == "grep_search":
-        q = (params.get("Query") or "").strip(' "\'')
-        q = re.sub(r'[\r\n\t]+', ' ', q)[:12]
-        return f"正在搜索代码: {q}" if q else "正在搜索代码"
-    elif tool_name == "find_by_name":
-        p = (params.get("Pattern") or "").strip(' "\'')
-        p = re.sub(r'[\r\n\t]+', ' ', p)[:12]
-        return f"正在查找文件: {p}" if p else "正在查找文件"
-    elif tool_name == "list_dir":
-        return "正在浏览目录结构"
-    elif tool_name == "search_web":
-        return "正在联网搜索资料"
-    elif tool_name == "read_url_content":
-        return "正在抓取网页内容"
-    elif tool_name == "invoke_subagent":
-        return "正在调度子智能体"
-    elif tool_name == "manage_task":
-        return "正在管理后台任务"
+    # 3. 抓取网页内容 (read_url_content) - 保留网址路径
+    if tool_name in ("read_url_content", "fetch_web_page", "browse_url"):
+        u = (params.get("Url") or params.get("url") or "").strip(' "\'`')
+        if u:
+            u_clean = re.sub(r'^https?://(www\.)?', '', u)
+            brief = (u_clean[:45] + "…") if len(u_clean) > 48 else u_clean
+            return f"抓取网页: `{brief}`"
+        return "抓取网页内容"
 
-    # 工具名中文映射兜底
-    TOOL_MAP = {
-        "run_command": "执行终端命令",
-        "view_file": "读取文件",
-        "write_to_file": "写入文件",
-        "replace_file_content": "编辑文件",
-        "grep_search": "搜索代码",
-        "find_by_name": "查找文件",
-        "list_dir": "浏览目录",
-        "search_web": "联网搜索",
-        "read_url_content": "抓取网页",
-        "manage_task": "管理任务",
-        "invoke_subagent": "调度智能体",
-    }
-    if tool_name in TOOL_MAP:
-        return f"正在{TOOL_MAP[tool_name]}"
+    # 4. 文件读写与检索 - 保留具体文件名或路径
+    if tool_name in ("view_file", "read_file"):
+        path = (params.get("AbsolutePath") or params.get("path") or params.get("file_path") or "").strip(' "\'')
+        fname = os.path.basename(path) if path else ""
+        return f"读取文件: `{fname}`" if fname else "读取文件"
 
-    if act:
-        return f"正在执行 {act[:20]}..." if len(act) > 22 else f"正在执行 {act}"
+    if tool_name in ("write_to_file", "replace_file_content", "edit_file"):
+        path = (params.get("TargetFile") or params.get("path") or params.get("file_path") or "").strip(' "\'')
+        fname = os.path.basename(path) if path else ""
+        return f"编辑文件: `{fname}`" if fname else "修改文件"
 
-    return "正在执行操作"
+    if tool_name in ("grep_search", "search_code"):
+        q = (params.get("Query") or params.get("query") or params.get("pattern") or "").strip(' "\'')
+        q = re.sub(r'[\r\n\t]+', ' ', q)[:25]
+        return f"搜索代码: `{q}`" if q else "搜索代码"
+
+    if tool_name in ("find_by_name", "find_file"):
+        p = (params.get("Pattern") or params.get("pattern") or "").strip(' "\'')
+        p = re.sub(r'[\r\n\t]+', ' ', p)[:25]
+        return f"查找文件: `{p}`" if p else "查找文件"
+
+    if tool_name == "list_dir":
+        p = (params.get("DirectoryPath") or params.get("path") or "").strip(' "\'')
+        fname = os.path.basename(p.rstrip('/')) if p else ""
+        return f"浏览目录: `{fname}`" if fname else "浏览目录结构"
+
+    if tool_name == "invoke_subagent":
+        return "调度子智能体"
+    if tool_name == "manage_task":
+        return "管理后台任务"
+
+    # 5. 显式 toolAction / toolSummary 兜底
+    act = params.get("toolAction") or params.get("toolSummary") or raw_action or ""
+    if isinstance(act, str) and act.strip():
+        act_clean = re.sub(r'[\r\n\t]+', ' ', act).strip()
+        brief = (act_clean[:38] + "…") if len(act_clean) > 40 else act_clean
+        return f"执行操作: {brief}"
+
+    return f"执行工具: {tool_name}" if tool_name else "执行操作"
 
 async def _stream_typewriter_to_feishu(bot_reply_msg_id, full_text, user_text, think_seconds, feishu_call_fn, start_index=0, completed_steps_count=0, total_planned_steps=0, is_voice=False):
-    """Fast stream full_text onto Feishu interactive card without artificial delay."""
+    """把尚未流式刷出的尾巴补到卡片上；文本用细粒度增量，避免 1500 字一整批跳变。"""
     if not bot_reply_msg_id or not full_text:
         return
-        
+
     total_len = len(full_text)
     if start_index >= total_len:
         return
-        
+
     remaining = total_len - start_index
-    if not is_voice:
-        # 文本模式：若剩余字符较少或已完整生成，直接一次性 patch 完成以保证极速响应
-        if remaining <= 1500:
-            card = CardBuilder.build_streaming_indicator(
-                full_text, tool_action=None, user_text=user_text, think_seconds=think_seconds,
-                completed_steps_count=completed_steps_count, total_planned_steps=total_planned_steps
-            )
-            await feishu_call_fn(
-                lambda: patch_interactive_card_sdk(bot_reply_msg_id, card),
-                label="typewriter patch fast"
-            )
-            return
-        
-    chunk_size = 28 if is_voice else 1500
+    # 流式阶段已基本刷完：留给最终卡即可，不再二次批刷
+    if not is_voice and remaining <= 64:
+        return
+
+    chunk_size = 28 if is_voice else 72
     current_len = start_index
     while current_len < total_len:
         current_len += chunk_size
         if current_len > total_len:
             current_len = total_len
-            
+
         typed_part = full_text[:current_len]
         card = CardBuilder.build_streaming_indicator(
             typed_part, tool_action=None, user_text=user_text, think_seconds=think_seconds,
             completed_steps_count=completed_steps_count, total_planned_steps=total_planned_steps
         )
-        
+
         await feishu_call_fn(
-            lambda: patch_interactive_card_sdk(bot_reply_msg_id, card),
+            lambda c=card: patch_interactive_card_sdk(bot_reply_msg_id, c),
             label="typewriter patch"
         )
-        if is_voice and current_len < total_len:
-            await asyncio.sleep(0.12)
+        if current_len < total_len:
+            await asyncio.sleep(0.035 if is_voice else 0.028)
 
 
 def parse_transcript_turn(transcript_path, initial_size=0):
@@ -617,7 +590,181 @@ def extract_final_chinese_response(text):
     text = re.sub(r'\[TASK_PLAN\].*?\[/TASK_PLAN\]\s*', '', text, flags=re.DOTALL | re.IGNORECASE).strip()
     text = re.sub(r'^\s*\[TASK_PLAN\][^\n]*(?:\n|$)', '', text, flags=re.IGNORECASE).strip()
 
+    # 10. 剥离泄漏的系统/排版指令残片（未闭合思考或模型复述规则时，正文会以半截指令开头）
+    text = re.sub(r'^[`\'"*\s]*标签内[。．.\s]*', '', text).strip()
+    text = re.sub(r'^\*{0,2}\s*内部[。．.]\s*\*{0,2}\s*', '', text).strip()
+    text = re.sub(
+        r'(?m)^\s*(?:\d+\.|[-*•])\s*遵循飞书排版规则[^\n]*\n?',
+        '',
+        text,
+    ).strip()
+    text = re.sub(
+        r'(?m)^\s*(?:\d+\.|[-*•])\s*(?:使用|请用|采用).{0,40}(?:markdown|Markdown|飞书|CardKit).{0,80}\n?',
+        '',
+        text,
+    ).strip()
+    # 行首孤立反引号 / 半截 code fence
+    text = re.sub(r'^`+\s*', '', text).strip()
+    # 模型复述的系统段标题行
+    text = re.sub(
+        r'(?m)^\[(?:System|Role|Feishu|Voice|Active|User|核心定位)[^\]]*\][^\n]*\n?',
+        '',
+        text,
+        flags=re.IGNORECASE,
+    ).strip()
+    # 残留的中英 XML/伪标签（含 </核心定位与角色>）
+    text = re.sub(r'</?[A-Za-z][\w.\-]*\b[^>]*>', '', text).strip()
+    text = re.sub(r'</?[\u4e00-\u9fff][\w\u4e00-\u9fff.\-]*\s*>', '', text).strip()
+
+    text = strip_leading_meta_preamble(text)
     return text
+
+
+def strip_leading_meta_preamble(text: str) -> str:
+    """砍掉正文开头的指令/思考残片，切到真正面向用户的答复起点。"""
+    if not text or not str(text).strip():
+        return text or ""
+    text = str(text).strip()
+    meta_re = re.compile(
+        r"(?:标签内|遵循飞书|飞书排版|CardKit|TASK_PLAN|"
+        r"System Rule|Feishu Style|核心定位|自主执行|折叠面板|点击查看|"
+        r"勿把长推理|简体中文直接|thinking|thought|"
+        r"^[*`\s]*内部[。．.]|"
+        r"^</?[\w\u4e00-\u9fff])",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    answer_re = re.compile(
+        r"^(?:#{1,3}\s+\S|"
+        r"(?:我是|我可以|我能帮|我能|我这边|你好|您好|好的|可以的|没问题|当然|"
+        r"已完成|已经|根据你|针对|关于|结论|总结|如下|以下是|简要|目前|这次|"
+        r"对于你|按你的|答：|回答：))"
+    )
+    lines = text.split("\n")
+    answer_idx = None
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if not s:
+            continue
+        if answer_re.search(s):
+            answer_idx = i
+            break
+    if answer_idx is not None and answer_idx > 0:
+        before = "\n".join(lines[:answer_idx])
+        if meta_re.search(before) or re.search(r"^[*`\s]*内部", before) or "</" in before or "<" in before:
+            return "\n".join(lines[answer_idx:]).strip()
+
+    # 逐行剥掉纯 meta 前缀行
+    while lines:
+        s = lines[0].strip()
+        if not s:
+            lines.pop(0)
+            continue
+        if meta_re.search(s) and not answer_re.search(s):
+            lines.pop(0)
+            continue
+        if re.match(r"^[*`\s]*内部[。．.]", s):
+            lines.pop(0)
+            continue
+        if re.match(r"^</?[\w\u4e00-\u9fff]", s):
+            lines.pop(0)
+            continue
+        break
+    return "\n".join(lines).strip()
+
+
+def scrub_reply_vs_reasoning(reply: str, reasoning: str) -> str:
+    """最终答复再清一遍：去掉与思考面板重叠的前缀，避免截断后「下半截」落到正文。"""
+    reply = strip_leading_meta_preamble(extract_final_chinese_response(reply or ""))
+    reasoning = (reasoning or "").strip()
+    if not reply or not reasoning:
+        return reply
+    # 若正文开头一小段已出现在思考里，整段前缀丢掉
+    for n in (160, 120, 80, 48, 24):
+        if len(reply) <= n:
+            continue
+        prefix = reply[:n]
+        if prefix in reasoning:
+            rest = reply[n:].lstrip("\n").lstrip()
+            # 避免切在汉字词中间后留下残片：再跑一轮 meta strip
+            return strip_leading_meta_preamble(rest) or rest
+    return reply
+
+
+def extract_thinking_content(text: str) -> str:
+    """从模型原文中抽出思考/推理片段（供最终卡片折叠面板保留）。"""
+    if not text:
+        return ""
+    chunks = []
+    # 注意：标签名必须按长到短匹配，避免 <thinking> 被 <think 吃掉
+    tag_pat = re.compile(
+        r"<(thinking|thought|think)>\s*(.*?)\s*</\1>",
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    for m in tag_pat.finditer(text):
+        piece = (m.group(2) or "").strip()
+        if piece and piece not in chunks:
+            chunks.append(piece)
+    # 仅匹配行首标题，避免误伤 </thinking> 里的单词
+    head_pat = re.compile(
+        r"^(?:\*\*|#{1,3}\s*)?(?:Thinking Process|Thought|Thinking|Reasoning|思考过程|推理过程)(?:\*\*|：|:)\s*(.+?)(?=\n\n|\Z)",
+        flags=re.DOTALL | re.IGNORECASE | re.MULTILINE,
+    )
+    for m in head_pat.finditer(text):
+        piece = (m.group(1) or "").strip()
+        if piece and piece not in chunks:
+            chunks.append(piece)
+    return "\n\n".join(chunks).strip()
+
+
+def build_process_narrative(planned_steps=None, completed_steps=None) -> str:
+    """把已执行的具体命令与工具调用整理成清晰可查的过程清单。"""
+    completed_steps = completed_steps or []
+    if not completed_steps and planned_steps:
+        return "\n".join(f"{i + 1}. ⏳ {step}" for i, step in enumerate(planned_steps)).strip()
+
+    lines = []
+    for i, step in enumerate(completed_steps, 1):
+        clean_step = str(step).strip()
+        if clean_step.startswith("正在"):
+            clean_step = clean_step[2:]
+        lines.append(f"{i}. ✅ {clean_step}")
+    return "\n".join(lines).strip()
+
+
+def compose_reasoning_panel_body(raw_text: str, planned_steps=None, completed_steps=None, max_chars: int = 6000) -> str:
+    """合并思考原文 + 执行的具体命令过程，供最终折叠卡片保留查看。"""
+    thinking = extract_thinking_content(raw_text or "")
+    process = build_process_narrative(planned_steps, completed_steps)
+    # 无标签思考时：用最终答复之前的前言作为软思考（去掉 TASK_PLAN / 标签残留）
+    if not thinking and raw_text:
+        answer = extract_final_chinese_response(raw_text)
+        preamble = raw_text
+        if answer:
+            idx = raw_text.find(answer[: min(48, len(answer))])
+            if idx > 20:
+                preamble = raw_text[:idx]
+        preamble = re.sub(
+            r"<(thinking|thought|think)>.*?</\1>",
+            "",
+            preamble,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        preamble = re.sub(r"\[TASK_PLAN\].*?\[/TASK_PLAN\]\s*", "", preamble, flags=re.DOTALL | re.IGNORECASE)
+        preamble = re.sub(r"^\s*\[TASK_PLAN\][^\n]*(?:\n|$)", "", preamble, flags=re.IGNORECASE)
+        preamble = preamble.strip()
+        if len(preamble) >= 24 and preamble != (answer or "").strip():
+            thinking = preamble
+
+    parts = []
+    if thinking:
+        parts.append(thinking)
+    if process:
+        parts.append("**执行过程与命令**\n" + process)
+    body = "\n\n".join(parts).strip()
+    if len(body) > max_chars:
+        body = body[: max_chars - 20] + "\n\n_(思考内容过长已截断)_"
+    return body
+
 
 def extract_choice_card_data(reply_text, transcript_path=None, initial_transcript_size=0):
     """
@@ -723,6 +870,98 @@ def extract_choice_card_data(reply_text, transcript_path=None, initial_transcrip
 
     return reply_text, None
 
+def _build_choice_elements(choice_card_data: Optional[dict]) -> list:
+    """Choice 区块 + 按钮，供终态单卡 elements_extra 使用。"""
+    if not choice_card_data or not choice_card_data.get("options"):
+        return []
+    opts = "\n".join(
+        f"{i}. {o}" for i, o in enumerate(choice_card_data["options"][:10], 1)
+    )
+    q = choice_card_data.get("question") or "请选择"
+    extra = [
+        {"tag": "hr"},
+        {
+            "tag": "markdown",
+            "content": f"**{q}**\n\n{opts}\n\n_(点击下方按钮或直接回复选项)_",
+        },
+    ]
+    for opt in choice_card_data["options"][:6]:
+        label = (opt[:20] + "…") if len(opt) > 20 else opt
+        extra.append({
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": label},
+            "type": "default",
+            "behaviors": [{
+                "type": "callback",
+                "value": {
+                    "action": "user_choice",
+                    "choice": opt,
+                    "label": label,
+                },
+            }],
+        })
+    return extra
+
+
+async def send_independent_final_reply(
+    message_id: str,
+    reply_text: str,
+    choice_card_data: Optional[dict] = None,
+    session_data: Optional[dict] = None,
+    reasoning_text: Optional[str] = None,
+    user_text: Optional[str] = None,
+    _feishu_call=None,
+) -> bool:
+    """终态回退：新发一张含思考+答复的完整卡片（主路径已改为同卡更新）。"""
+    if not reply_text or not str(reply_text).strip():
+        return False
+
+    # 1. 尝试使用 CardKit 2.0 现代卡片
+    try:
+        from lark_stream import build_final_markdown_card_json, create_card_entity, reply_card_by_ref
+
+        extra = _build_choice_elements(choice_card_data)
+        final_json = build_final_markdown_card_json(
+            reply_text,
+            elements_extra=extra or None,
+            reasoning_text=reasoning_text or None,
+            user_text=user_text,
+        )
+
+        card_id = await _feishu_call(lambda: create_card_entity(final_json), label="create final cardkit")
+        if card_id:
+            msg_id = await _feishu_call(lambda: reply_card_by_ref(message_id, card_id), label="reply final cardkit")
+            if msg_id:
+                return True
+    except Exception as e:
+        log.warning(f"[Executor] send CardKit final reply failed: {e}")
+
+    # 2. 降级：标准交互卡片
+    try:
+        from card_builder import CardBuilder
+        from lark_client import send_interactive_card_sdk
+        card = CardBuilder.build_ai_response(
+            reply_text,
+            choice_card_data=choice_card_data,
+            session_data=session_data,
+            reasoning_text=reasoning_text,
+        )
+        msg_id = await _feishu_call(lambda: send_interactive_card_sdk(message_id, card), label="fallback card send")
+        if msg_id:
+            return True
+    except Exception as e:
+        log.warning(f"[Executor] fallback interactive card failed: {e}")
+
+    # 3. 兜底：纯文本回复
+    try:
+        from lark_client import send_reply_sdk
+        await _feishu_call(lambda: send_reply_sdk(message_id, reply_text), label="fallback text send")
+        return True
+    except Exception as e:
+        log.error(f"[Executor] all final reply sends failed: {e}")
+        return False
+
+
 async def execute_antigravity(
     chat_id, user_text, message_id, bot_reply_msg_id, session_data, 
     is_new_conversation, system_instruction, final_prompt, downloaded_file_name, 
@@ -763,7 +1002,6 @@ async def execute_antigravity(
             return None
     
     async def _sync_conversation_id_from_log(log_path):
-        """从 antigravity 日志中解析 conversation ID 并同步落盘到 session_data。"""
         nonlocal target_transcript_path
         if not os.path.exists(log_path):
             return
@@ -877,31 +1115,92 @@ async def execute_antigravity(
                 )
             )
 
-            if attempt == 1:
-                if is_resumed:
-                    init_card = CardBuilder.build_typing_indicator(
-                        downloaded_file_name, download_success,
-                        f"🔄 检测到服务刚完成重启，正在自动继续执行未完成的任务...\n\n{user_text}",
-                        is_voice=is_voice_message
-                    )
-                else:
-                    init_card = CardBuilder.build_typing_indicator(
-                        downloaded_file_name, download_success, user_text, is_voice=is_voice_message
-                    )
-            else:
-                init_card = CardBuilder.build_typing_indicator(
-                    downloaded_file_name, download_success,
-                    f"🔄 首次发起因无响应挂死，正在自动为您重新发起第 {attempt}/2 次重试...\n\n{user_text}",
-                    is_voice=is_voice_message
-                )
+            # Bridge-like RunSession：一张 CardKit 卡承载整轮 run（优先续用 pipeline 占位）
+            run_session = None
+            cardkit_stream = None
+            _pending_cardkit_text = None
+            _cardkit_push_task = None
+            if not is_voice_message:
+                try:
+                    from bridge_core.run_session import RunSession, get_active_run
 
-            if bot_reply_msg_id:
-                if attempt > 1 or is_resumed:
-                    await _feishu_call(
-                        lambda: patch_interactive_card_sdk(bot_reply_msg_id, init_card),
-                        label=f"init-card patch attempt {attempt}"
+                    existing = get_active_run(chat_id)
+                    existing_ck = (task_meta or {}).get("cardkit_card_id") if task_meta else None
+                    existing_msg = bot_reply_msg_id or ((task_meta or {}).get("bot_reply_msg_id") if task_meta else None)
+                    existing_seq = int((task_meta or {}).get("cardkit_sequence") or 0) if task_meta else 0
+                    existing_run = (task_meta or {}).get("run_id") if task_meta else None
+                    # 仅复用「同一 run_id + 仍在 running」的会话，避免跨轮串台
+                    same_run = (
+                        existing
+                        and existing.message_id
+                        and (not existing_msg or existing.message_id == existing_msg)
+                        and (not existing_run or existing.run_id == existing_run)
+                        and (existing.state or {}).get("terminal") == "running"
+                        and not getattr(existing, "stop_requested", False)
                     )
-            else:
+                    if same_run:
+                        run_session = existing
+                        bot_reply_msg_id = run_session.message_id
+                        cardkit_stream = run_session.card
+                        log.info(f"[Executor] Reusing active RunSession run_id={run_session.run_id}")
+                    elif existing and not same_run:
+                        try:
+                            from bridge_core.run_session import unregister_active_run
+                            unregister_active_run(chat_id, getattr(existing, "run_id", None))
+                        except Exception:
+                            pass
+                    elif existing_ck and existing_msg:
+                        run_session = RunSession.attach(
+                            chat_id,
+                            existing_ck,
+                            existing_msg,
+                            sequence=existing_seq,
+                            run_id=existing_run,
+                            user_text=user_text,
+                        )
+                        if run_session:
+                            bot_reply_msg_id = existing_msg
+                            cardkit_stream = run_session.card
+                            log.info(f"[Executor] Attached RunSession card_id={existing_ck}")
+                    elif message_id and str(message_id).startswith("om_"):
+                        run_session = await _feishu_call(
+                            lambda: RunSession.start_as_reply(
+                                chat_id, message_id, user_text=user_text, initial_label="思考中…"
+                            ),
+                            timeout=12.0,
+                            label="run_session start",
+                        )
+                        if run_session:
+                            bot_reply_msg_id = run_session.message_id
+                            cardkit_stream = run_session.card
+                            if task_meta is not None:
+                                task_meta["bot_reply_msg_id"] = bot_reply_msg_id
+                                task_meta["cardkit_card_id"] = run_session.card_id
+                                task_meta["cardkit_sequence"] = getattr(run_session.card, "sequence", 0) or 0
+                                task_meta["run_id"] = run_session.run_id
+                    if run_session:
+                        run_session.process = process
+                        run_session.apply(
+                            {"type": "meta", "userText": user_text, "chatId": chat_id},
+                            push=False,
+                        )
+                        # 勿把 label 也设成「思考中…」，会与 phase 叠成「思考中… 思考中…」
+                        prog = {"type": "progress", "phase": "thinking"}
+                        if attempt > 1 or is_resumed:
+                            prog["label"] = "重新执行中…"
+                        await _feishu_call(
+                            lambda: run_session.apply(prog, force=True),
+                            timeout=8.0,
+                            label="run_session progress",
+                        )
+                except Exception as e:
+                    log.warning(f"[Executor] RunSession unavailable, legacy path: {e}")
+
+            # 无 RunSession 时才发旧 typing 卡（语音 / CardKit 失败）
+            if not run_session and not bot_reply_msg_id:
+                init_card = CardBuilder.build_typing_indicator(
+                    downloaded_file_name, download_success, user_text, is_voice=is_voice_message
+                )
                 new_id = await _feishu_call(
                     lambda: send_interactive_card_sdk(message_id, init_card),
                     label=f"init-card send attempt {attempt}"
@@ -910,15 +1209,52 @@ async def execute_antigravity(
                     bot_reply_msg_id = new_id
                     if task_meta is not None:
                         task_meta["bot_reply_msg_id"] = new_id
-                        try:
-                            from database import save_pending_task
-                            save_pending_task(chat_id, task_meta)
-                        except Exception:
-                            pass
-                else:
-                    log.warning(f"[Executor] Initial typing card send failed for chat {chat_id}; will fall back to sending final card as new message")
-            
+
+            async def _flush_cardkit_pushes():
+                nonlocal _cardkit_push_task
+                if run_session:
+                    await _feishu_call(lambda: run_session.flush(), timeout=8.0, label="run_session flush")
+                if _cardkit_push_task is not None:
+                    try:
+                        await _cardkit_push_task
+                    except Exception:
+                        pass
+                    _cardkit_push_task = None
+
+            def _schedule_cardkit_content(text: str):
+                """兼容旧调用：有 RunSession 时改为 set_text 事件。"""
+                nonlocal _pending_cardkit_text, _cardkit_push_task
+                if run_session and not run_session.failed:
+                    run_session.apply({"type": "set_text", "content": text or ""}, push=True)
+                    return
+                if not cardkit_stream or cardkit_stream.failed:
+                    return
+                _pending_cardkit_text = text
+                if _cardkit_push_task is not None and not _cardkit_push_task.done():
+                    return
+
+                async def _runner():
+                    nonlocal _pending_cardkit_text
+                    while _pending_cardkit_text is not None and cardkit_stream and not cardkit_stream.failed:
+                        payload = _pending_cardkit_text
+                        _pending_cardkit_text = None
+                        await _feishu_call(
+                            lambda t=payload: cardkit_stream.set_content(t),
+                            timeout=8.0,
+                            label="cardkit content",
+                        )
+
+                _cardkit_push_task = asyncio.create_task(_runner())
+
+            def _schedule_run_push():
+                if run_session and not run_session.failed:
+                    try:
+                        run_session.push()
+                    except Exception:
+                        pass
+
             accumulated_text = ""
+            accumulated_thinking = ""
             stderr_text = ""
             stream_result_response = None
             stream_error_msg = ""
@@ -948,7 +1284,7 @@ async def execute_antigravity(
                 return None
 
             last_streamed_length = 0
-            last_patch_time = time.time()
+            last_patch_time = 0.0
             process_start_time = time.time()
             last_progress_time = process_start_time
             last_cpu_check_time = 0
@@ -964,7 +1300,55 @@ async def execute_antigravity(
             typesafe_blocked_info = None
             evaluated_tool_calls = set()
             last_patched_card_sig = ""
-            
+            # 对齐 bridge：流式刷卡 latest-wins，不阻塞读 agent 事件
+            _pending_stream_card = None
+            _stream_patch_task = None
+            STREAM_PATCH_MIN_INTERVAL = 0.05
+
+            async def _flush_stream_patches():
+                nonlocal _stream_patch_task
+                if _stream_patch_task is not None:
+                    try:
+                        await _stream_patch_task
+                    except Exception:
+                        pass
+                    _stream_patch_task = None
+
+            def _schedule_stream_card(card):
+                """合并待发送卡片；有进行中的 patch 时只更新 pending，避免主循环被飞书 API 拖成一批一批。"""
+                nonlocal _pending_stream_card, _stream_patch_task, last_patch_time, last_patched_card_sig
+                if not bot_reply_msg_id or not card:
+                    return
+                card_sig = str(card.get("elements", []))
+                if card_sig == last_patched_card_sig and _pending_stream_card is None:
+                    return
+                _pending_stream_card = card
+                if _stream_patch_task is not None and not _stream_patch_task.done():
+                    return
+
+                async def _runner():
+                    nonlocal _pending_stream_card, last_patch_time, last_patched_card_sig
+                    while _pending_stream_card is not None:
+                        wait = STREAM_PATCH_MIN_INTERVAL - (time.time() - last_patch_time)
+                        if wait > 0:
+                            await asyncio.sleep(wait)
+                        card_to_send = _pending_stream_card
+                        _pending_stream_card = None
+                        if not bot_reply_msg_id or not card_to_send:
+                            continue
+                        sig = str(card_to_send.get("elements", []))
+                        if sig == last_patched_card_sig:
+                            continue
+                        last_patch_time = time.time()
+                        last_patched_card_sig = sig
+                        await _feishu_call(
+                            lambda c=card_to_send: patch_interactive_card_sdk(bot_reply_msg_id, c),
+                            timeout=8.0,
+                            label="indicator patch"
+                        )
+
+                _stream_patch_task = asyncio.create_task(_runner())
+
             # 从配置中读取超时配置，支持自定义配置并设置合理防御值
             BASE_STALL_TIMEOUT = getattr(config, "STALL_TIMEOUT", 600)
             BASE_STALL_HARD_TIMEOUT = getattr(config, "STALL_HARD_TIMEOUT", 3600)
@@ -975,7 +1359,7 @@ async def execute_antigravity(
             turn_stream = await sess.send_prompt_and_stream(system_instruction + final_prompt)
 
             while True:
-                event_data = await turn_stream.get_event(timeout=0.2)
+                event_data = await turn_stream.get_event(timeout=0.08)
                 now = time.time()
 
                 events_to_process = [event_data] if event_data else []
@@ -1005,7 +1389,23 @@ async def execute_antigravity(
                     elif event_type == "step_update":
                         step_up = ev.get("step_update", {})
                         step_t = step_up.get("step_type")
-                        if step_t == "agent_response":
+                        if step_t in ("thought", "thinking", "reasoning"):
+                            tdelta = (
+                                step_up.get("text_delta")
+                                or step_up.get("text")
+                                or step_up.get("thought")
+                                or ""
+                            )
+                            if tdelta:
+                                accumulated_thinking += tdelta
+                                if run_session:
+                                    try:
+                                        from utils.feishu_markdown import sanitize_feishu_markdown
+                                        tdelta_ui = sanitize_feishu_markdown(tdelta) or tdelta
+                                    except Exception:
+                                        tdelta_ui = tdelta
+                                    run_session.apply({"type": "thinking", "delta": tdelta_ui}, push=True)
+                        elif step_t == "agent_response":
                             delta = step_up.get("text_delta")
                             if delta:
                                 accumulated_text += delta
@@ -1013,9 +1413,20 @@ async def execute_antigravity(
                                 if parsed_steps and parsed_steps != planned_steps:
                                     planned_steps = parsed_steps
                                     current_plan_idx = min(current_plan_idx, len(planned_steps) - 1)
+                                # RunSession 正文由循环内 clean_partial → set_text 统一同步（避免 delta+全量双刷）
                             if current_tool_action:
                                 if current_tool_action not in completed_tool_steps:
                                     completed_tool_steps.append(current_tool_action)
+                                if run_session:
+                                    run_session.apply(
+                                        {
+                                            "type": "tool_result",
+                                            "id": current_tool_action,
+                                            "status": "done",
+                                            "label": current_tool_action,
+                                        },
+                                        push=False,
+                                    )
                                 current_tool_action = ""
                                 stream_action = ""
                                 tool_in_flight_start_time = None
@@ -1032,6 +1443,16 @@ async def execute_antigravity(
                                 if current_tool_action and act != current_tool_action:
                                     if current_tool_action not in completed_tool_steps:
                                         completed_tool_steps.append(current_tool_action)
+                                    if run_session:
+                                        run_session.apply(
+                                            {
+                                                "type": "tool_result",
+                                                "id": current_tool_action,
+                                                "status": "done",
+                                                "label": current_tool_action,
+                                            },
+                                            push=False,
+                                        )
                                 current_tool_action = act
                                 stream_action = act
                                 last_tool_action = act
@@ -1040,6 +1461,17 @@ async def execute_antigravity(
                                 if planned_steps:
                                     current_plan_idx = CardBuilder.match_step_index(
                                         planned_steps, current_plan_idx, act, len(completed_tool_steps)
+                                    )
+                                if run_session:
+                                    run_session.apply(
+                                        {
+                                            "type": "tool_use",
+                                            "id": act,
+                                            "name": t_name or "tool",
+                                            "label": act,
+                                            "input": t_params,
+                                        },
+                                        push=True,
                                     )
                             # Co-Pilot 对高风险工具事件进行语义复核；普通工具由本地规则和 CLI 沙箱保护。
                             ts_tier = getattr(config, "TYPESAFE_TIER", "gateway") or "gateway"
@@ -1169,14 +1601,21 @@ async def execute_antigravity(
                     else:
                         log.error(f"[Executor] Process stalled for chat {chat_id} (stall={stall_seconds}s, limit={effective_stall_timeout}s, hard={effective_stall_hard_timeout}s), closing session...")
                         await sess.close()
-                        error_card = CardBuilder.build_stall_error_card(user_text, think_seconds, stall_seconds)
-                        if bot_reply_msg_id:
+                        stderr_text = f"⚠️ 任务已检测到假死并自动终止（连续 {stall_seconds // 60} 分钟没有任何输出、进程树无任何 CPU 活跃且无任何工具在运行）。"
+                        session_data["last_execution_error"] = True
+                        if run_session:
+                            await _feishu_call(
+                                lambda: run_session.finish_error(stderr_text),
+                                label="stall run_session error",
+                            )
+                        elif bot_reply_msg_id:
+                            error_card = CardBuilder.build_stall_error_card(user_text, think_seconds, stall_seconds)
                             await _feishu_call(
                                 lambda: patch_interactive_card_sdk(bot_reply_msg_id, error_card),
                                 label="stall error card patch"
                             )
-                        stderr_text = f"⚠️ 任务已检测到假死并自动终止（连续 {stall_seconds // 60} 分钟没有任何输出、进程树无任何 CPU 活跃且无任何工具在运行）。"
-                        session_data["last_execution_error"] = True
+                        await _flush_cardkit_pushes()
+                        await _flush_stream_patches()
                         return {"has_reply": True, "reply_text": stderr_text, "is_error": True}
 
                 if think_seconds > 43200:
@@ -1184,6 +1623,8 @@ async def execute_antigravity(
                     await sess.close()
                     stderr_text = "⚠️ 执行超时 (12小时)：后台超大型任务已达到系统设定的 12 小时最高保护上限。"
                     session_data["last_execution_error"] = True
+                    await _flush_cardkit_pushes()
+                    await _flush_stream_patches()
                     return {"has_reply": True, "reply_text": stderr_text, "is_error": True}
 
                 has_active_tool = bool(current_tool_action or stream_action or last_tool_action or completed_tool_steps or has_tool_in_flight)
@@ -1199,54 +1640,122 @@ async def execute_antigravity(
                         cp = re.sub(r'^\s*\[TASK_PLAN\][^\n]*(?:\n|$)', '', cp, flags=re.IGNORECASE).strip()
                         clean_partial = cp.strip()
 
-                has_tool_in_flight = bool(current_tool_action or stream_action)
-                is_complex = bool(planned_steps or completed_tool_steps)
+                # 实时提取正在输出的思考内容（支持未闭合的 <thinking> 标签）
+                clean_thinking = ""
+                is_thinking_closed = False
+                if accumulated_text:
+                    match_th = re.search(
+                        r'<(?:thinking|thought|think)>(.*?)(?:</(?:thinking|thought|think)>|\Z)',
+                        accumulated_text,
+                        re.DOTALL | re.IGNORECASE,
+                    )
+                    if match_th:
+                        raw_th = match_th.group(1).strip()
+                        raw_th = re.sub(r'\[TASK_PLAN\].*?\[/TASK_PLAN\]\s*', '', raw_th, flags=re.DOTALL | re.IGNORECASE)
+                        raw_th = re.sub(r'^\s*\[TASK_PLAN\][^\n]*(?:\n|$)', '', raw_th, flags=re.IGNORECASE)
+                        clean_thinking = raw_th.strip()
+                        if re.search(r'</(?:thinking|thought|think)>', accumulated_text, re.IGNORECASE):
+                            is_thinking_closed = True
+                elif accumulated_thinking:
+                    clean_thinking = accumulated_thinking.strip()
 
-                # 判定是否切换到打字机文本流式输出：
-                # 1. 如果工具正在执行中，绝对不切换，保持显示规划步骤/工具进度卡片；
-                # 2. 如果是纯问答无工具任务，只要有文本输出立即打字机流式呈现；
-                # 3. 如果是多步骤复杂任务，仅在所有工具执行完毕、且模型输出实质性总结文本（>=25字）时才切换至打字机
+                is_thinking_active = bool(clean_thinking and not is_thinking_closed and not clean_partial)
+
+                has_tool_in_flight = bool(current_tool_action or stream_action)
+
+                # 流式策略（对齐 lark-agent-bridge / Cursor）：
+                # 一旦有可展示的 assistant 文本就原地 patch 打字机卡片；
+                # 工具执行期间也继续刷正文（工具名挂在状态栏），避免「整段攒完再一批发出」。
                 is_streaming_text = False
                 guard_before_delivery = (
                     config.TYPESAFE_ENABLED
                     and config.TYPESAFE_TIER in ("sentry", "copilot")
                 )
-                if clean_partial and not has_tool_in_flight:
+                if clean_partial and len(clean_partial) >= 1:
                     if is_voice_message:
-                        # 语音对话模式：流式生成期间不提前打字剧透，优先保证语音消息首先送达
+                        # 语音对话：流式阶段不剧透文字，优先语音送达
                         is_streaming_text = False
                     elif guard_before_delivery:
-                        # Do not expose unreviewed text; final output is checked before delivery.
+                        # sentry/copilot：终审前不暴露未审核正文
                         is_streaming_text = False
-                    elif not is_complex:
-                        is_streaming_text = True
                     else:
-                        min_chars = 15 if (planned_steps and current_plan_idx >= len(planned_steps) - 1) else 25
-                        if len(clean_partial) >= min_chars:
-                            if planned_steps:
-                                current_plan_idx = len(planned_steps) - 1
-                            is_streaming_text = True
+                        is_streaming_text = True
 
-                desired_patch_interval = 0.20
-                if is_streaming_text:
+                if run_session and not run_session.failed:
+                    # 1. 实时同步思考过程（若在思考中，卡片展开并流式滚动思考文字）
+                    if clean_thinking:
+                        run_session.apply(
+                            {"type": "set_thinking", "content": clean_thinking, "active": is_thinking_active},
+                            push=False,
+                        )
+
+                    # 2. 区分正文流式 / 纯思考流式 / 状态心跳
+                    if is_streaming_text:
+                        last_streamed_length = len(clean_partial)
+                        # 用清洗后的 partial 同步正文（避免 TASK_PLAN 等噪音）
+                        run_session.apply({"type": "set_text", "content": clean_partial}, push=True)
+                    elif is_thinking_active:
+                        _schedule_run_push()
+                    elif stall_seconds >= effective_warning_threshold and not is_worker_active and not has_tool_in_flight:
+                        run_session.apply(
+                            {
+                                "type": "progress",
+                                "phase": "thinking",
+                                "label": f"已等待 {stall_seconds}s",
+                                "detail": f"总耗时 {think_seconds}s",
+                            },
+                            push=True,
+                        )
+                    else:
+                        _schedule_run_push()
+                elif is_streaming_text:
                     display_partial = clean_partial
                     last_streamed_length = len(clean_partial)
-                    indicator_card = CardBuilder.build_streaming_indicator(
-                        display_partial,
-                        None,
-                        user_text,
-                        think_seconds,
-                        completed_steps_count=len(completed_tool_steps),
-                        total_planned_steps=len(planned_steps) if planned_steps else 0
-                    )
-                    desired_patch_interval = 0.20
+                    active_action = current_tool_action or stream_action or ""
+                    if cardkit_stream and not cardkit_stream.failed:
+                        if active_action:
+                            from cards.indicators import clean_action_text
+                            tip = clean_action_text(active_action)
+                            stream_body = f"*🛠️ {tip}*\n\n{display_partial}" if tip else display_partial
+                        else:
+                            stream_body = display_partial
+                        _schedule_cardkit_content(stream_body)
+                    else:
+                        indicator_card = CardBuilder.build_streaming_indicator(
+                            display_partial,
+                            active_action or None,
+                            user_text,
+                            think_seconds,
+                            completed_steps_count=len(completed_tool_steps),
+                            total_planned_steps=len(planned_steps) if planned_steps else 0
+                        )
+                        _schedule_stream_card(indicator_card)
                 elif stall_seconds >= effective_warning_threshold and not is_worker_active and not has_tool_in_flight:
-                    indicator_card = CardBuilder.build_stall_warning_card(user_text, think_seconds, stall_seconds)
-                    desired_patch_interval = 2.0
+                    if cardkit_stream and not cardkit_stream.failed:
+                        _schedule_cardkit_content(
+                            f"**⏱️ AI 深度推理中**\n\n"
+                            f"已连续等待约 **{stall_seconds}s**（总耗时 {think_seconds}s）。\n\n"
+                            f"_模型仍在推理或调度工具，请稍候…_"
+                        )
+                    else:
+                        indicator_card = CardBuilder.build_stall_warning_card(user_text, think_seconds, stall_seconds)
+                        _schedule_stream_card(indicator_card)
                 else:
                     active_action = current_tool_action or stream_action
                     display_action = active_action or (last_tool_action if not planned_steps else "")
-                    if display_action or completed_tool_steps or planned_steps:
+                    if cardkit_stream and not cardkit_stream.failed:
+                        from cards.indicators import build_cardkit_progress_markdown
+                        _schedule_cardkit_content(
+                            build_cardkit_progress_markdown(
+                                user_text=user_text,
+                                think_seconds=think_seconds,
+                                tool_action=display_action or None,
+                                completed_steps=completed_tool_steps,
+                                planned_steps=planned_steps,
+                                is_voice=is_voice_message,
+                            )
+                        )
+                    elif display_action or completed_tool_steps or planned_steps:
                         indicator_card = CardBuilder.build_tool_indicator(
                             display_action,
                             user_text,
@@ -1258,21 +1767,14 @@ async def execute_antigravity(
                             current_step_idx=current_plan_idx,
                             process_status=process_status_info
                         )
+                        _schedule_stream_card(indicator_card)
                     else:
                         indicator_card = CardBuilder.build_typing_indicator(
                             downloaded_file_name, download_success, user_text, think_seconds, is_voice=is_voice_message
                         )
-                    desired_patch_interval = 0.25
-
-                card_sig = str(indicator_card.get("elements", []))
-                if (card_sig != last_patched_card_sig) and (time.time() - last_patch_time >= desired_patch_interval):
-                    last_patch_time = time.time()
-                    last_patched_card_sig = card_sig
-                    if bot_reply_msg_id:
-                        await _feishu_call(
-                            lambda: patch_interactive_card_sdk(bot_reply_msg_id, indicator_card),
-                            label="indicator patch"
-                        )
+                        _schedule_stream_card(indicator_card)
+            await _flush_cardkit_pushes()
+            await _flush_stream_patches()
             await turn_stream.aclose()
 
             if hasattr(sess, "get_recent_stderr"):
@@ -1391,22 +1893,6 @@ async def execute_antigravity(
                 except Exception as e:
                     log.error(f"Failed to extract generated images from transcript: {e}")
             
-            if not is_quota_exhausted and reply_text:
-                active_project = session_data.get("project")
-                ws_root = session_data.get("workspace_root")
-                allowed_dirs = [active_project, ws_root]
-                
-                await _feishu_call(
-                    lambda: extract_and_upload_resources(reply_text, message_id, api_client, allowed_dirs, chat_id=chat_id),
-                    timeout=120.0,
-                    label="extract_and_upload_resources"
-                )
-                
-                if os.path.exists(log_file_path):
-                    await _sync_conversation_id_from_log(log_file_path)
-                
-                is_error = False
-
             if not reply_text:
                 if not quota_err_reply:
                     quota_err_reply = await detect_and_format_quota_error(combined_err_text, model=session_data.get("model", ""))
@@ -1419,6 +1905,7 @@ async def execute_antigravity(
             elif is_quota_exhausted:
                 is_error = True
             else:
+                is_error = False
                 approx_tokens = len(user_text) + len(reply_text)
                 if transcript_path and os.path.exists(transcript_path):
                     try:
@@ -1450,7 +1937,8 @@ async def execute_antigravity(
                     task_meta.get("is_voice_message")
                 )
             )
-            # Sentry / Co-Pilot 必须在文字和语音发出前检查最终回复。
+            # Sentry / Co-Pilot 必须在文字、语音、附件发出前检查最终回复。
+            output_blocked = bool(typesafe_blocked_info)
             if reply_text and not typesafe_blocked_info:
                 if config.TYPESAFE_ENABLED and config.TYPESAFE_TIER in ("sentry", "copilot"):
                     try:
@@ -1464,12 +1952,41 @@ async def execute_antigravity(
                                 "🛡️ **[System One 内容安全拦截]**\n\n"
                                 f"系统检测到回复存在风险或检查服务不可用：{guard_res.reason}。"
                             )
+                            output_blocked = True
                     except Exception as e:
                         log.warning(f"[TypeSafe Sentry] Egress guard failed before delivery: {e}")
                         reply_text = "🛡️ 回复安全检查未能完成，本次内容已暂缓发送。"
+                        output_blocked = True
+
+            # 用户已点停止：不再投递附件/语音/正文，只收口卡片
+            stop_requested = bool(
+                run_session
+                and (
+                    getattr(run_session, "stop_requested", False)
+                    or (run_session.state or {}).get("terminal") == "interrupted"
+                )
+            )
+            if stop_requested:
+                reply_text = ""
+                output_blocked = True
+                is_error = False
+
+            # 附件投递放在安全门之后，避免拦截文案前文件已发出；与 send_to_feishu 共用去重
+            if not is_error and not output_blocked and not is_quota_exhausted and reply_text:
+                active_project = session_data.get("project")
+                ws_root = session_data.get("workspace_root")
+                allowed_dirs = [active_project, ws_root]
+                from bridge_core.media_out import deliver_outbound_media
+                cleaned = await _feishu_call(
+                    lambda: deliver_outbound_media(reply_text, message_id, api_client, allowed_dirs, chat_id=chat_id),
+                    timeout=120.0,
+                    label="deliver_outbound_media",
+                )
+                if isinstance(cleaned, str) and cleaned.strip():
+                    reply_text = cleaned
 
             # 1. 优先生成并发送原生语音消息，确保语音条率先送达聊天窗口！
-            if is_voice_message and not is_error and reply_text:
+            if is_voice_message and not is_error and not output_blocked and reply_text:
                 try:
                     from voice_service import send_native_voice_reply
                     log.info("[Executor] Voice reply prioritized: generating and delivering audio message first...")
@@ -1480,8 +1997,8 @@ async def execute_antigravity(
                 except Exception as e:
                     log.error(f"[Executor] Prioritized voice reply failed or timed out: {e}")
 
-            # 2. 语音消息已送达，紧接着让卡片启动打字机效果呈现完整文字
-            if not is_error and bot_reply_msg_id and reply_text:
+            # 2. 非 CardKit：补打字机尾巴；CardKit 由原生 typewriter 负责
+            if not is_error and bot_reply_msg_id and reply_text and not (cardkit_stream and not cardkit_stream.failed):
                 try:
                     safe_start_index = 0 if is_voice_message else min(last_streamed_length, len(reply_text))
                     await _stream_typewriter_to_feishu(
@@ -1536,40 +2053,157 @@ async def execute_antigravity(
                 except Exception as e:
                     log.warning(f"[Executor] Failed to persist last_ai_summary: {e}")
 
-            final_card = CardBuilder.build_ai_response(
-                reply_text, 
-                choice_card_data=choice_card_data,
-                current_model=session_data.get('model', 'Default'),
-                current_project=session_data.get('project', '默认'),
-                is_error=is_error,
-                is_streaming=False,
-                session_data=session_data,
-                is_quota=is_quota_exhausted
-            )
-            if bot_reply_msg_id:
-                patch_ok = await _feishu_call(
-                    lambda: patch_interactive_card_sdk(bot_reply_msg_id, final_card),
-                    label="final-card patch"
+            # 飞书排版清洗（去掉 file:// 等）+ 保留思考/过程供最终卡片展示
+            reasoning_text = ""
+            try:
+                from utils.feishu_markdown import sanitize_feishu_markdown
+                raw_for_reason = accumulated_text or reply_text or ""
+                if accumulated_thinking.strip():
+                    raw_for_reason = (
+                        f"<thinking>\n{accumulated_thinking.strip()}\n</thinking>\n\n{raw_for_reason}"
+                    )
+                reasoning_text = compose_reasoning_panel_body(
+                    raw_for_reason,
+                    planned_steps=planned_steps,
+                    completed_steps=completed_tool_steps,
                 )
-                if patch_ok is None:
-                    from lark_client import send_reply_sdk
-                    fallback_text = reply_text[:2000] if reply_text else "(AI 回复卡片发送失败，请查看工作区获取完整内容)"
-                    await _feishu_call(
-                        lambda: send_reply_sdk(message_id, fallback_text),
-                        label="final-card text fallback"
+                if reasoning_text:
+                    reasoning_text = sanitize_feishu_markdown(reasoning_text)
+                if reply_text:
+                    # 思考进折叠面板后，正文必须再剥一遍指令残片 / 与思考重叠的前缀
+                    reply_text = scrub_reply_vs_reasoning(reply_text, reasoning_text)
+                    reply_text = sanitize_feishu_markdown(reply_text)
+            except Exception as e:
+                log.warning(f"[Executor] reasoning compose failed: {e}")
+
+            # Bridge 终态：RunSession.finish_done / finish_error（单卡 + 可选 choice 按钮）
+            delivered_via_cardkit = False
+            if run_session and not is_voice_message:
+                try:
+                    await _flush_cardkit_pushes()
+                    # 用户已点停止：保持 interrupted，勿再刷成 done/error
+                    if getattr(run_session, "stop_requested", False) or run_session.state.get("terminal") == "interrupted":
+                        # 再刷一次 interrupted，清掉停止按钮
+                        if getattr(run_session, "card", None):
+                            run_session.card.failed = False
+                        await _feishu_call(
+                            lambda: run_session.finish_interrupted(),
+                            timeout=12.0,
+                            label="run_session finish_interrupted",
+                        )
+                        delivered_via_cardkit = True
+                    else:
+                        extra = []
+                        if choice_card_data and choice_card_data.get("options"):
+                            opts = "\n".join(
+                                f"{i}. {o}" for i, o in enumerate(choice_card_data["options"][:10], 1)
+                            )
+                            q = choice_card_data.get("question") or "请选择"
+                            extra.append({"tag": "hr"})
+                            extra.append({
+                                "tag": "markdown",
+                                "content": f"**{q}**\n\n{opts}\n\n_(点击下方按钮或直接回复选项)_",
+                            })
+                            btns = []
+                            for opt in choice_card_data["options"][:6]:
+                                label = (opt[:20] + "…") if len(opt) > 20 else opt
+                                btns.append({
+                                    "tag": "button",
+                                    "text": {"tag": "plain_text", "content": label},
+                                    "type": "default",
+                                    "behaviors": [{
+                                        "type": "callback",
+                                        "value": {
+                                            "action": "user_choice",
+                                            "choice": opt,
+                                            "label": label,
+                                        },
+                                    }],
+                                })
+                            # CardKit 2.0: 按钮直接进 elements，勿包 tag:action
+                            extra.extend(btns)
+                        if getattr(run_session, "card", None):
+                            run_session.card.failed = False
+                        run_session.failed = False
+                        if is_error:
+                            ok = await _feishu_call(
+                                lambda: run_session.finish_error(reply_text or "执行失败"),
+                                timeout=12.0,
+                                label="run_session finish_error",
+                            )
+                        else:
+                            # 单卡收口：折叠思考/过程 + 最终答复 + 可选 choice，不再拆第二条消息
+                            body = (reply_text or "").strip() if not output_blocked else ""
+                            if not body:
+                                body = "_✅ 处理完成_"
+                            extra = _build_choice_elements(choice_card_data) if not output_blocked else []
+                            ok = await _feishu_call(
+                                lambda: run_session.finish_done(
+                                    body,
+                                    reasoning=reasoning_text or "",
+                                    elements_extra=extra or None,
+                                ),
+                                timeout=12.0,
+                                label="run_session finish_done",
+                            )
+                        delivered_via_cardkit = bool(ok)
+                        if not ok and run_session.card_id:
+                            # 再试一次 CardKit 终态卡，禁止掉进 V1 patch
+                            from lark_stream import build_final_markdown_card_json
+                            final_json = build_final_markdown_card_json(
+                                reply_text or "_(空回复)_",
+                                reasoning_text=None if is_error else reasoning_text,
+                                user_text=user_text,
+                                elements_extra=_build_choice_elements(choice_card_data) or None,
+                            )
+                            run_session.card.failed = False
+                            ok2 = await _feishu_call(
+                                lambda: run_session.card.replace_with_card(final_json),
+                                timeout=12.0,
+                                label="cardkit final replace retry",
+                            )
+                            delivered_via_cardkit = bool(ok2)
+                except Exception as e:
+                    log.warning(f"[Executor] RunSession final delivery failed: {e}")
+            elif cardkit_stream and not is_voice_message:
+                try:
+                    await _flush_cardkit_pushes()
+                    from lark_stream import build_final_markdown_card_json
+                    body = (reply_text or "").strip() if not output_blocked else ""
+                    if not body:
+                        body = "_✅ 处理完成_" if not is_error else (reply_text or "执行失败")
+                    final_json = build_final_markdown_card_json(
+                        body,
+                        reasoning_text=None if is_error else reasoning_text,
+                        user_text=user_text,
+                        elements_extra=_build_choice_elements(choice_card_data) or None,
                     )
-            else:
-                if message_id and str(message_id).startswith("om_"):
-                    await _feishu_call(
-                        lambda: send_interactive_card_sdk(message_id, final_card),
-                        label="final-card send"
+                    cardkit_stream.failed = False
+                    ok = await _feishu_call(
+                        lambda: cardkit_stream.replace_with_card(final_json),
+                        timeout=12.0,
+                        label="cardkit final replace",
                     )
-                else:
-                    from lark_client import send_card_to_chat_sdk
-                    await _feishu_call(
-                        lambda: send_card_to_chat_sdk(chat_id, final_card),
-                        label="final-card send to chat"
-                    )
+                    delivered_via_cardkit = bool(ok)
+                except Exception as e:
+                    log.warning(f"[Executor] CardKit final delivery failed: {e}")
+            if not delivered_via_cardkit:
+                # CardKit V2 消息不能用 schema V1 patch；改为新发一张终态卡，避免僵尸「思考中」
+                try:
+                    import importlib
+                    import cards.response as _resp_mod
+                    importlib.reload(_resp_mod)
+                except Exception:
+                    pass
+                await send_independent_final_reply(
+                    message_id,
+                    reply_text or "_(空回复)_",
+                    choice_card_data=choice_card_data,
+                    session_data=session_data,
+                    reasoning_text=None if is_error else reasoning_text,
+                    user_text=user_text,
+                    _feishu_call=_feishu_call,
+                )
 
             return {"has_reply": bool(final_reply), "returncode": process.returncode, "is_error": is_error, "is_quota_error": is_quota_exhausted}
 
@@ -1579,6 +2213,13 @@ async def execute_antigravity(
                 await turn_stream.aclose()
             if sess_locked and 'sess' in dir() and sess.lock.locked():
                 sess.lock.release()
+            try:
+                from bridge_core.run_session import unregister_active_run
+                rs = locals().get("run_session")
+                if rs is not None:
+                    unregister_active_run(chat_id, getattr(rs, "run_id", None))
+            except Exception:
+                pass
             if os.path.exists(log_file_path):
                 try:
                     await _sync_conversation_id_from_log(log_file_path)

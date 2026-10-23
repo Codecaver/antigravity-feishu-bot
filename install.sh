@@ -152,7 +152,7 @@ else
 fi
 echo ""
 
-# --- 3. 交互式环境变量配置 ---
+# --- 3. 配置虚拟环境与依赖（扫码向导依赖新版 lark-oapi，需先装好）---
 configure_env=true
 if [ -f .env ]; then
     read -p "⚠️ 检测到已存在 .env 配置文件，是否覆盖？[y/N]: " overwrite_env
@@ -161,25 +161,8 @@ if [ -f .env ]; then
         echo "⏭️ 跳过环境变量配置，使用现有 .env 文件。"
     fi
 fi
-
-if [ "$configure_env" = true ]; then
-    echo "------------------------------------------"
-    echo "请输入飞书应用的配置信息 (可在飞书开发者后台获取):"
-    read -p "👉 FEISHU_APP_ID (例: cli_a4...): " app_id
-    read -p "👉 FEISHU_APP_SECRET: " app_secret
-
-    if [ -z "$app_id" ] || [ -z "$app_secret" ]; then
-        echo "❌ APP_ID 或 APP_SECRET 不能为空，部署中断。"
-        exit 1
-    fi
-
-    echo "FEISHU_APP_ID=$app_id" > .env
-    echo "FEISHU_APP_SECRET=$app_secret" >> .env
-    echo "✅ .env 配置文件已成功生成。"
-fi
 echo ""
 
-# --- 4. 配置虚拟环境与依赖 ---
 echo "📦 开始配置 Python 虚拟环境并安装依赖..."
 if [ ! -d "venv" ]; then
     if ! python3 -m venv venv; then
@@ -210,9 +193,39 @@ if [ -f requirements.txt ]; then
     pip install -r requirements.txt
 else
     echo "⚠️ 未找到 requirements.txt，尝试直接安装 lark-oapi..."
-    pip install lark-oapi
+    pip install 'lark-oapi>=1.7.4' qrcode
 fi
 echo "✅ 依赖安装完成。"
+echo ""
+
+# --- 4. 飞书应用凭据（扫码创建 或 手动填写）---
+if [ "$configure_env" = true ]; then
+    echo "------------------------------------------"
+    echo "配置飞书应用凭据："
+    echo "  1) 扫码创建飞书应用（推荐，与 lark-agent-bridge 同机制）"
+    echo "  2) 手动输入已有 APP_ID / APP_SECRET"
+    read -p "👉 请选择 [1/2]（默认 1）: " cred_mode
+    cred_mode=${cred_mode:-1}
+
+    if [[ "$cred_mode" == "2" ]]; then
+        read -p "👉 FEISHU_APP_ID (例: cli_a4...): " app_id
+        read -p "👉 FEISHU_APP_SECRET: " app_secret
+        if [ -z "$app_id" ] || [ -z "$app_secret" ]; then
+            echo "❌ APP_ID 或 APP_SECRET 不能为空，部署中断。"
+            exit 1
+        fi
+        echo "FEISHU_APP_ID=$app_id" > .env
+        echo "FEISHU_APP_SECRET=$app_secret" >> .env
+        echo "✅ .env 配置文件已成功生成。"
+    else
+        echo "📱 即将打开扫码向导，请用飞书 App 扫码…"
+        if ! python wizard.py setup; then
+            echo "❌ 扫码创建失败。可改选手动填写，或稍后执行: python wizard.py setup"
+            exit 1
+        fi
+        echo "✅ 扫码创建完成，凭据已写入 .env。"
+    fi
+fi
 echo ""
 
 # --- 5. PM2 启动服务 ---

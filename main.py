@@ -17,7 +17,8 @@ os.environ["PATH"] += (
 
 import lark_oapi as lark
 
-from config import APP_ID, APP_SECRET, BASE_DIR
+import config
+from config import BASE_DIR
 from logger import log
 from lark_client import send_reply_sdk
 from garbage_collection import garbage_collector
@@ -166,7 +167,8 @@ async def main():
     plugin_manager.register_system_commands([
         "/help", "/model", "/card", "/menu", "/project", "/note", "/notes",
         "/status", "/context", "/quota", "/clear", "/stop", "/update", "/ping",
-        "/newproj_resolve", "/cron", "/schedule", "/plugin", "/plugins", "/user"
+        "/newproj_resolve", "/cron", "/schedule", "/plugin", "/plugins", "/user",
+        "/grant", "/auth", "/s1", "/sys1", "/system1", "/ts", "/typesafe",
     ])
     plugin_manager.load_all_plugins()
 
@@ -188,8 +190,8 @@ async def main():
     )
 
     cli = lark.ws.Client(
-        APP_ID,
-        APP_SECRET,
+        config.APP_ID,
+        config.APP_SECRET,
         event_handler=event_handler,
         log_level=lark.LogLevel.INFO,
     )
@@ -277,6 +279,9 @@ def cleanup(signum, frame):
 
 
 if __name__ == "__main__":
+    from wizard import bootstrap_credentials
+
+    bootstrap_credentials()
     signal.signal(signal.SIGINT, cleanup)
     signal.signal(signal.SIGTERM, cleanup)
     asyncio.run(main())

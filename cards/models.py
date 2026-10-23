@@ -102,30 +102,34 @@ def build_model_panel(available_models, current_model):
 
 
 def build_model_switch_result_card(new_model, old_model):
-    model_lower = new_model.lower()
+    model_lower = (new_model or "").lower()
     if "gemini" in model_lower:
-        icon, color = "💎", "blue"
+        icon = "💎"
     elif "claude" in model_lower:
-        icon, color = "🧠", "purple"
+        icon = "🧠"
     elif "gpt" in model_lower:
-        icon, color = "⚡", "green"
+        icon = "⚡"
     else:
-        icon, color = "🔮", "grey"
-        
-    elements = [
-        {
-            "tag": "markdown",
-            "content": f"🎉 **模型切换成功！**\n\n{icon} 当前活跃模型已变更为：\n\n> **`{new_model}`**\n\n🔄 上一个模型：~~{old_model}~~\n\n*接下来的所有对话都将使用新模型进行响应。*"
-        },
-        {"tag": "hr"},
-        create_footer()
-    ]
-    
+        icon = "🔮"
+
+    old_line = ""
+    if old_model and old_model != new_model:
+        old_line = f"\n\n🔄 上一个模型：~~{old_model}~~"
+
+    # 恢复原先完整文案；不设 header（全局会剥彩条，再插入标题会叠冗余）
+    content = (
+        f"🎉 **模型切换成功！**\n\n"
+        f"{icon} 当前活跃模型已变更为：\n\n"
+        f"> **`{new_model}`**"
+        f"{old_line}\n\n"
+        f"*接下来的所有对话都将使用新模型进行响应。*"
+    )
+
     return {
         "config": {"wide_screen_mode": True},
-        "header": {
-            "template": color,
-            "title": {"content": f"{icon} 模型已切换", "tag": "plain_text"}
-        },
-        "elements": elements
+        "elements": [
+            {"tag": "markdown", "content": content},
+            {"tag": "hr"},
+            create_footer(),
+        ],
     }
