@@ -36,20 +36,8 @@ def render_card(state: Dict[str, Any], elements_extra: Optional[List[dict]] = No
         else:
             elements.extend(_render_tool_group(group.get("tools") or [], finalized=terminal != "running"))
 
-    # 运行中：仅在还没有任何可见内容时放 md_body 占位（便于后续打字机 patch）。
-    # 已有思考引用 / 工具步骤时再塞「…」会显得多余。
-    if terminal == "running" and not body_added:
-        has_tools = any((b.get("kind") == "tool") for b in (state.get("blocks") or []))
-        has_reasoning = bool((reasoning.get("content") or "").strip())
-        if not has_tools and not has_reasoning:
-            elements.append(
-                {
-                    "tag": "markdown",
-                    "element_id": "md_body",
-                    "content": "…",
-                }
-            )
-            body_added = True
+    # 运行中：不要用「…」占位。启动阶段已有「思考中…」活动行；
+    # 首段正文到来时再插入 md_body，由整卡替换接入打字机。
 
     # choice / 额外按钮放在完成标记之前
     if elements_extra:
@@ -107,11 +95,12 @@ def render_card(state: Dict[str, Any], elements_extra: Optional[List[dict]] = No
         )
 
     if not elements:
+        # 极端空卡兜底；运行中通常至少有活动行/停止键，不会走到这里
         elements.append(
             {
                 "tag": "markdown",
                 "element_id": "md_body",
-                "content": "…" if terminal == "running" else "_（空）_",
+                "content": "_处理中…_" if terminal == "running" else "_（空）_",
             }
         )
 
