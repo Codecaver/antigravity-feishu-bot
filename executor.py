@@ -1255,6 +1255,8 @@ async def execute_antigravity(
 
             accumulated_text = ""
             accumulated_thinking = ""
+            # 工具调用前的过渡文本；工具触发后清空，仅保留工具后的结论作最终答复（上游 v3.2）
+            current_turn_text = ""
             stderr_text = ""
             stream_result_response = None
             stream_error_msg = ""
@@ -1409,6 +1411,7 @@ async def execute_antigravity(
                             delta = step_up.get("text_delta")
                             if delta:
                                 accumulated_text += delta
+                                current_turn_text += delta
                                 parsed_steps = CardBuilder.parse_task_plan(accumulated_text)
                                 if parsed_steps and parsed_steps != planned_steps:
                                     planned_steps = parsed_steps
@@ -1439,6 +1442,20 @@ async def execute_antigravity(
                             if not isinstance(t_params, dict):
                                 t_params = {}
                             act = format_tool_action(t_name, t_params)
+
+                            # 工具调用前的过渡文本不进入最终答复
+                            if current_turn_text:
+                                parsed_steps = CardBuilder.parse_task_plan(accumulated_text)
+                                if parsed_steps and parsed_steps != planned_steps:
+                                    planned_steps = parsed_steps
+                                current_turn_text = ""
+                            if not planned_steps and hasattr(CardBuilder, "generate_task_plan"):
+                                try:
+                                    planned_steps = CardBuilder.generate_task_plan(user_text)[:4]
+                                    current_plan_idx = 0
+                                except Exception:
+                                    pass
+
                             if act:
                                 if current_tool_action and act != current_tool_action:
                                     if current_tool_action not in completed_tool_steps:
@@ -1819,13 +1836,17 @@ async def execute_antigravity(
 
             transcript_path = target_transcript_path or await loop.run_in_executor(None, get_latest_transcript_file)
 
-            # 优先从本轮直接实时接收到的流式文本 / 最终 result 中提取回答，完全避免读取到历史轮次的 transcript
+            # 优先用工具后的 current_turn_text，避免把工具前过渡推理拼进最终答复（上游 v3.2）
             if typesafe_blocked_info:
                 pass
+            elif current_turn_text and current_turn_text.strip():
+                final_reply = current_turn_text.strip()
             elif stream_result_response and stream_result_response.strip():
-                final_reply = stream_result_response.strip()
+                tx_reply = extract_final_response_from_transcript(transcript_path, initial_transcript_size)
+                final_reply = tx_reply if (tx_reply and completed_tool_steps) else stream_result_response.strip()
             elif accumulated_text and accumulated_text.strip():
-                final_reply = accumulated_text.strip()
+                tx_reply = extract_final_response_from_transcript(transcript_path, initial_transcript_size)
+                final_reply = tx_reply if tx_reply else accumulated_text.strip()
             else:
                 final_reply = extract_final_response_from_transcript(transcript_path, initial_transcript_size)
             

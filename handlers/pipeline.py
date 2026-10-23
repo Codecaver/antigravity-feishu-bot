@@ -205,6 +205,35 @@ async def process_chat_queue(chat_id):
             chat_queues.pop(chat_id, None)
 
 
+async def _finalize_fastpath_turn(message_id: str, chat_id: str, session_data: dict, is_error: bool = False, result_text: str = ""):
+    """Finalizes a FastPath turn by notifying plugins (stopping buzzer/LED thinking state),
+    marking the Feishu message as DONE, and releasing any pending state."""
+    try:
+        from plugin_manager import plugin_manager
+        if is_error:
+            session_data["last_execution_error"] = True
+            await plugin_manager.dispatch_after_ai(result_text or "❌ 操作执行失败", chat_id, session_data)
+        else:
+            session_data["last_execution_error"] = False
+            await plugin_manager.dispatch_after_ai(result_text or "已完成操作", chat_id, session_data)
+    except Exception as e:
+        log.warning(f"[Pipeline] FastPath dispatch_after_ai error: {e}")
+
+    try:
+        from database import save_session_async
+        await save_session_async(chat_id, session_data)
+    except Exception as e:
+        log.debug(f"[Pipeline] FastPath save_session_async error: {e}")
+
+    try:
+        if is_error:
+            await set_emoji(message_id, "CrossMark")
+        else:
+            await set_emoji(message_id, "DONE")
+    except Exception as e:
+        log.debug(f"[Pipeline] FastPath set_emoji error: {e}")
+
+
 async def _process_single_task(chat_id, task):
     message_id = task["message_id"]
     message_type = task["message_type"]
@@ -260,6 +289,15 @@ async def _process_single_task(chat_id, task):
     if not user_text:
         return
 
+    # 0. 插件前置输入拦截与预处理 (Hook: on_before_ai)
+    # 优先拦截处理处于交互式等待状态的输入 (如配置网关 URL、Token 等)，杜绝无谓的 Jev 认知网关冷启动与 FastPath 串扰
+    from plugin_manager import plugin_manager
+    user_text, session_data = await plugin_manager.dispatch_before_ai(user_text, chat_id, session_data)
+    if not user_text or not user_text.strip():
+        log.info(f"Message in chat {chat_id} was intercepted and consumed by plugin hook. Skipping AI execution.")
+        await _finalize_fastpath_turn(message_id, chat_id, session_data, is_error=False, result_text="已由插件前置拦截处理。")
+        return
+
     # 🚀 极致性能优化：抢先下发首张打字机/思考交互卡片（秒回卡片）
     # 彻底杜绝因等待 TypeSafe Jev 远程认知网关（~2s）、插件初始化或会话锁导致的前端卡片延迟
     is_voice_message = bool(
@@ -310,38 +348,35 @@ async def _process_single_task(chat_id, task):
                         pass
             except Exception as e:
                 log.warning(f"[Pipeline] Failed to send early typing card for chat {chat_id}: {e}")
-    # 先预热上一轮的档位，与 Jev 判定并行；若新档位不同，判定后再切到精确档位。
-    prewarm_task = None
-    prewarmed_model = session_data.get("model", "Default")
-    prewarmed_effort = session_data.get("reasoning_effort", "low")
-    try:
-        from session_pool import session_pool
-        proj_val = session_data.get("project")
-        cwd_dir = proj_val if (proj_val and os.path.isdir(proj_val) and proj_val not in ["默认", "Default"]) else None
-        conv_id_to_resume = session_data.get("conversation", "") if not is_resumed else ""
-        prewarm_task = asyncio.create_task(
-            session_pool.prewarm(
-                chat_id, prewarmed_model, cwd_dir,
-                conversation_id=conv_id_to_resume, effort=prewarmed_effort
-            )
-        )
-    except Exception:
-        pass
 
-    # === System One (Jev) Decision Gateway & Guardrail ===
-    from system_one_gate import evaluate_message_gate
+    # === System One (Jev) + HMDM Hybrid Mathematical Decision Gateway ===
+    from system_one_gate import evaluate_message_gate, infer_effort_from_model, evaluate_adaptive_tier, resolve_adaptive_model
     from plugin_manager import plugin_manager
 
     recent_context = get_recent_conversation_context(session_data)
-    decision = await evaluate_message_gate(user_text, context=recent_context)
+
+    # Use HMDM (<0.3ms) to predict effort before prewarming so we don't spawn and immediately kill a mismatched process
+    prewarm_task = None
+    prewarmed_model = session_data.get("model", "Default")
+    prewarmed_effort = infer_effort_from_model(prewarmed_model, session_data.get("reasoning_effort", "medium"))
+    try:
+        from math_decision_model import math_decision_engine
+        local_preview = math_decision_engine.evaluate_decision(chat_id, user_text, remote_jev_data=None)
+        if getattr(config, "TYPESAFE_AUTO_MODE", True) and local_preview.effort_tier:
+            base_m = session_data.get("base_model") or session_data.get("model", "Default")
+            prewarmed_model = resolve_adaptive_model(base_m, local_preview.effort_tier)
+            prewarmed_effort = infer_effort_from_model(prewarmed_model, local_preview.effort_tier.lower())
+    except Exception:
+        pass
+
+    decision = await evaluate_message_gate(user_text, context=recent_context, chat_id=chat_id)
     was_local_fast_path = bool(decision.raw_answers.get("fast_path"))
     if not decision.is_fallback and not was_local_fast_path:
         session_data["typesafe_decision_count"] = 1
     else:
         session_data["typesafe_decision_count"] = 0
 
-    from system_one_gate import evaluate_adaptive_tier, resolve_adaptive_model
-    # 纯语义判定自适应思考层级（基于 System One 对上下文与待办任务的认知评估）
+    # 纯语义 + HMDM 连续数理模型判定自适应思考层级
     adaptive_tier = evaluate_adaptive_tier(decision)
 
     from config import DEFAULT_MODEL
@@ -359,11 +394,15 @@ async def _process_single_task(chat_id, task):
         session_data.pop("typesafe_adaptive_tier", None)
         session_data["base_model"] = base_model
         session_data["model"] = base_model
-        session_data["reasoning_effort"] = "medium"
+        # 兼容：显式带档位的模型名（-high/-low/-medium）提取 effort，避免 CLI 参数冲突
+        session_data["reasoning_effort"] = infer_effort_from_model(
+            base_model, session_data.get("reasoning_effort", "medium")
+        )
     await save_session_async(chat_id, session_data)
 
     selected_model = session_data.get("model", "Default")
-    selected_effort = session_data.get("reasoning_effort", "medium")
+    selected_effort = infer_effort_from_model(selected_model, session_data.get("reasoning_effort", "medium"))
+    session_data["reasoning_effort"] = selected_effort
     needs_selected_prewarm = (
         selected_model != prewarmed_model or selected_effort != prewarmed_effort
     )
@@ -419,10 +458,16 @@ async def _process_single_task(chat_id, task):
             f"🛡️ **安全拦截**\n\n检测到高风险请求，已阻止执行。\n\n> {user_text[:200]}"
         )
         await _finalize_early_card(warn_card, as_v2_markdown=warn_md)
+        await _finalize_fastpath_turn(
+            message_id, chat_id, session_data, is_error=True, result_text="⚠️ 安全沙箱门禁拦截危险请求"
+        )
         return
 
     # 2. 插件极速直达通道 (Fast-Path / 零模型冷启动延迟)
-    if decision.intent == "typesafe_status" and decision.intent_confidence >= 0.65:
+    typesafe_keywords = ["typesafe", "type_safe", "s1", "system1", "system 1", "system one", "决策网关", "直觉决策"]
+    user_text_lower = user_text.lower()
+    is_explicit_typesafe = any(kw in user_text_lower for kw in typesafe_keywords)
+    if decision.intent == "typesafe_status" and decision.intent_confidence >= 0.65 and is_explicit_typesafe:
         log.info(f"[TypeSafe FastPath] Direct dispatch typesafe config inquiry for chat {chat_id}")
         from system_one_gate import get_typesafe_config_state, test_typesafe_connectivity
         cfg = get_typesafe_config_state()
@@ -446,6 +491,7 @@ async def _process_single_task(chat_id, task):
             await app_state.run_feishu_sync(loop, lambda: patch_interactive_card_sdk(bot_reply_msg_id, ts_card))
         else:
             await loop.run_in_executor(None, lambda: send_interactive_card_sdk(message_id, ts_card))
+        await _finalize_fastpath_turn(message_id, chat_id, session_data, is_error=False, result_text="已展示决策网关配置看板。")
         return
 
     elif decision.intent == "server_health" and decision.intent_confidence >= 0.70:
@@ -454,6 +500,7 @@ async def _process_single_task(chat_id, task):
             log.info(f"[TypeSafe FastPath] Direct dispatch to server_health plugin for chat {chat_id}")
             handled = await health_plugin.on_command("/health", "", chat_id, message_id, session_data)
             if handled:
+                await _finalize_fastpath_turn(message_id, chat_id, session_data, is_error=False, result_text="已查询服务器健康状态。")
                 return
 
     elif decision.intent == "notes" and decision.intent_confidence >= 0.75:
@@ -465,6 +512,7 @@ async def _process_single_task(chat_id, task):
                 log.info(f"[TypeSafe FastPath] Direct dispatch note listing to notes_manager for chat {chat_id}")
                 handled = await notes_plugin.on_command("/notes", "", chat_id, message_id, session_data)
                 if handled:
+                    await _finalize_fastpath_turn(message_id, chat_id, session_data, is_error=False, result_text="已为您列出备忘录。")
                     return
             else:
                 # 提取笔记文本
@@ -473,6 +521,7 @@ async def _process_single_task(chat_id, task):
                     log.info(f"[TypeSafe FastPath] Direct dispatch add note to notes_manager for chat {chat_id}")
                     handled = await notes_plugin.on_command("/note", f"add {cleaned_note}", chat_id, message_id, session_data)
                     if handled:
+                        await _finalize_fastpath_turn(message_id, chat_id, session_data, is_error=False, result_text=f"已成功记录备忘：{cleaned_note}")
                         return
 
     elif decision.intent == "cron" and decision.intent_confidence >= 0.75:
@@ -484,45 +533,60 @@ async def _process_single_task(chat_id, task):
                     log.info(f"[TypeSafe FastPath] Direct dispatch schedule intent to cron_scheduler for chat {chat_id}")
                     handled = await cron_plugin.on_command("/cron", user_text, chat_id, message_id, session_data)
                     if handled:
+                        await _finalize_fastpath_turn(message_id, chat_id, session_data, is_error=False, result_text="已成功添加定时计划任务。")
                         return
             except Exception as e:
                 log.warning(f"[TypeSafe FastPath] Failed to parse schedule intent: {e}")
 
+    elif decision.intent == "smart_home" and decision.intent_confidence >= 0.70:
+        ha_plugin = plugin_manager.plugins.get("home_assistant")
+        if ha_plugin and ha_plugin.enabled and getattr(ha_plugin, "is_jev_enabled", lambda: True)():
+            log.info(f"[TypeSafe FastPath] Direct dispatch smart_home to Home Assistant plugin for chat {chat_id}")
+            try:
+                handled = await ha_plugin.handle_nlp_intent(user_text, chat_id, message_id, session_data, bot_reply_msg_id=bot_reply_msg_id)
+                if handled:
+                    action_msg = getattr(ha_plugin, "last_action_msg", None) or "已为您完成智能家居操作。"
+                    await _finalize_fastpath_turn(message_id, chat_id, session_data, is_error=False, result_text=action_msg)
+                    return
+            except Exception as e:
+                log.warning(f"[TypeSafe FastPath] Home Assistant dispatch failed: {e}")
+
     # Plugin fast paths above do not need an agent process. For model-backed
     # requests, warm the exact selected model/effort before prompt construction.
-    if needs_selected_prewarm:
-        try:
-            if prewarm_task:
-                await prewarm_task
-            from session_pool import session_pool
-            proj_val = session_data.get("project")
-            cwd_dir = proj_val if (proj_val and os.path.isdir(proj_val) and proj_val not in ["默认", "Default"]) else None
-            conv_id_to_resume = session_data.get("conversation", "") if not is_resumed else ""
-            prewarm_task = asyncio.create_task(
-                session_pool.prewarm(
-                    chat_id, selected_model, cwd_dir,
-                    conversation_id=conv_id_to_resume, effort=selected_effort
-                )
+    try:
+        if prewarm_task:
+            await prewarm_task
+        from session_pool import session_pool
+        proj_val = session_data.get("project")
+        cwd_dir = proj_val if (proj_val and os.path.isdir(proj_val) and proj_val not in ["默认", "Default"]) else None
+        conv_id_to_resume = session_data.get("conversation", "") if not is_resumed else ""
+        prewarm_task = asyncio.create_task(
+            session_pool.prewarm(
+                chat_id, selected_model, cwd_dir,
+                conversation_id=conv_id_to_resume, effort=selected_effort
             )
-        except Exception as e:
-            log.warning(f"[Pipeline] Selected-effort prewarm failed to schedule: {e}")
+        )
+    except Exception as e:
+        log.warning(f"[Pipeline] Selected-effort prewarm failed to schedule: {e}")
 
-    # 3. 运行插件 on_before_ai 钩子
-    user_text, session_data = await plugin_manager.dispatch_before_ai(user_text, chat_id, session_data)
-    if not user_text or not user_text.strip():
-        log.info(f"Message in chat {chat_id} was intercepted and consumed by plugin hook. Skipping AI execution.")
-        return
+    # 3. 插件 on_before_ai 钩子已在流程入口处优先执行完毕 (跳过重复调用)
 
-    # 4. 智能意图路由与人机交互规范 (严格贯彻：区分提问与命令)
+    # 4. 智能意图路由与人机交互规范 (严格贯彻：区分提问与命令 + 正交任务规划协议)
     # 提问/咨询：纯文本高效解答，不无端调用工具
-    # 命令/操作：自主决策并调用工具执行到底，绝对严禁推诿让用户手动在终端执行！
-    # Keep the full planning protocol for genuinely complex work. Simple
-    # operations still retain the execution-capable interaction instructions
-    # below, but avoid paying the prompt/latency cost of a multi-step plan.
+    # 命令/操作（包含 Medium 与 High 档位）：统一注入 [TASK_PLAN] 3~4 步规划协议并自主调用工具执行到底！
+    is_pure_non_op_chat = (
+        decision.action_type in ("casual_greeting", "informational_inquiry")
+        and not decision.is_operation
+        and not decision.needs_terminal
+        and not getattr(decision, "needs_task_plan", False)
+    )
     is_complex_agent = (
         session_data.get("mode") == "agent"
-        or adaptive_tier == "High"
-    )
+        or adaptive_tier in ("Medium", "High")
+        or getattr(decision, "needs_task_plan", False)
+        or decision.is_operation
+        or decision.needs_terminal
+    ) and not is_pure_non_op_chat
     if not adaptive_tier:  # Preserve the legacy behavior when auto mode is off.
         is_complex_agent = is_complex_agent or (
             decision.is_operation
@@ -531,6 +595,7 @@ async def _process_single_task(chat_id, task):
             or decision.intent in ("server_health", "cron", "notes")
             or decision.complexity_score >= 0.6
         )
+    session_data["needs_task_plan"] = bool(is_complex_agent)
 
     # Inject protocol into prompt
     current_proj = session_data.get("project", "默认")
@@ -598,11 +663,11 @@ async def _process_single_task(chat_id, task):
             "2. 【受限递归与安全避让】：严禁系统全盘无限制递归搜索；严禁重启当前飞书机器人自身进程。\n"
             "3. 【计划任务调度能力】：用户有定时提醒或周期任务时，使用 run_command 执行 CLI 注册到 cron_scheduler 引擎中。\n\n"
         )
-        if getattr(config, "TYPESAFE_TIER", "gateway") == "copilot":
+        if getattr(config, "TYPESAFE_TIER", "gateway") == "copilot" or getattr(decision, "security_level", "L0") == "L2":
             system_instruction += (
-                "[System One Co-Pilot Safety & Reflection Directive / 全链路执行与自愈规则]\n"
-                "当前系统处于 System One Level 3 (全链路保护) 模式。\n"
-                "1. 【工具调用前审慎】：核验命令参数的安全性与受控性，严禁超出项目目录的不可逆破坏操作。\n"
+                "[System One Co-Pilot & HMDM L2 Safety Directive / 全链路高风险受控执行规则]\n"
+                "当前请求触发了 System One Level 3 或 HMDM L2 累积风险门禁（不受 Low/Medium 复杂度档位豁免）。\n"
+                "1. 【工具调用前审慎】：核验命令参数的安全性与受控性，严禁超出项目目录的不可逆破坏操作（如批量删除、强制重置、停止核心服务）。\n"
                 "2. 【报错自愈反思】：命令执行失败退出码非 0 时，深入分析根因自愈修正，严禁机械重复失败命令。\n\n"
             )
         project_prompts = session_data.get("project_prompts", {})
@@ -683,26 +748,8 @@ async def _process_single_task(chat_id, task):
             memory_block = "\n".join([f"- {m}" for m in memories])
             final_prompt = f"[System Context: User preferences:]\n{memory_block}\n\n[User's Message:]\n{user_text}"
             
-    # Delegate execution to executor
-    # 动态热加载最新模块（确保所有新代码逻辑即改即生效，无需外部重启进程中断会话）
-    try:
-        import sys, importlib
-        if "config" in sys.modules:
-            importlib.reload(sys.modules["config"])
-        if "cards.common" in sys.modules:
-            importlib.reload(sys.modules["cards.common"])
-        if "cards.response" in sys.modules:
-            importlib.reload(sys.modules["cards.response"])
-        if "cards.indicators" in sys.modules:
-            importlib.reload(sys.modules["cards.indicators"])
-        if "cards" in sys.modules:
-            importlib.reload(sys.modules["cards"])
-        if "executor" in sys.modules:
-            importlib.reload(sys.modules["executor"])
-        from executor import execute_antigravity as _current_execute_antigravity
-    except Exception as reload_err:
-        log.warning(f"[Pipeline] Dynamic module reload warning: {reload_err}")
-        _current_execute_antigravity = execute_antigravity
+    # Delegate execution to executor（避免每条消息 importlib.reload 清掉全局状态）
+    _current_execute_antigravity = execute_antigravity
 
     # 43200s (12小时) 总超时兜底：支持长达数小时至十几小时的超大型自动化工程任务
     # 超时时 CancelledError 会进入 execute_antigravity，其 finally 块仍会执行清理
@@ -722,7 +769,21 @@ async def _process_single_task(chat_id, task):
     except Exception as e:
         log.error(f"[Pipeline] execute_antigravity raised for chat {chat_id}: {e}")
         is_error = True
-    
+
+    # Update HMDM Markov dialog state post-turn
+    try:
+        from math_decision_model import math_decision_engine
+        math_decision_engine.update_post_turn_state(
+            chat_id,
+            had_error=bool(is_error),
+            proposed_plan_or_question=bool(session_data.get("last_turn_proposed_plan", False)),
+            tier_used=(adaptive_tier if adaptive_tier in ("Low", "Medium", "High") else "Medium"),
+            needs_plan_used=bool(is_complex_agent),
+            complexity_used=float(decision.complexity_score),
+        )
+    except Exception as e:
+        log.debug(f"[HMDM] Post-turn state update skipped: {e}")
+
     if is_error:
         await set_emoji(message_id, "CrossMark")
     else:

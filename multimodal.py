@@ -19,6 +19,8 @@ from lark_client import (
 
 
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic"}
+MAX_IMAGE_UPLOAD_BYTES = 10 * 1024 * 1024  # 飞书图片上限 10MB（上游 v3.2）
+MAX_FILE_UPLOAD_BYTES = 30 * 1024 * 1024   # 飞书文件上限 30MB
 
 
 def _strip_local_media_markdown(text: str, delivered_abs: set) -> str:
@@ -165,6 +167,9 @@ def extract_and_upload_resources(text, message_id, api_client, additional_safe_d
         if not os.path.exists(img_path):
             return False
         try:
+            if os.path.getsize(img_path) > MAX_IMAGE_UPLOAD_BYTES:
+                log.warning(f"[Multimodal] Skipping oversized image (>10MB): {img_path}")
+                return False
             with open(img_path, "rb") as f:
                 req = lark.api.im.v1.CreateImageRequest.builder().request_body(
                     lark.api.im.v1.CreateImageRequestBody.builder().image_type("message").image(f).build()
@@ -272,6 +277,9 @@ def extract_and_upload_resources(text, message_id, api_client, additional_safe_d
 
         if os.path.exists(abs_file):
             try:
+                if os.path.getsize(abs_file) > MAX_FILE_UPLOAD_BYTES:
+                    log.warning(f"[Multimodal] Skipping oversized file (>30MB): {abs_file}")
+                    continue
                 duration_ms = None
                 is_opus_voice = (ext_lower == ".opus")
                 if is_opus_voice:

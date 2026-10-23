@@ -31,6 +31,12 @@ class PluginManager:
     def load_all_plugins(self):
         """Discover and load all valid plugins from plugins/ directory."""
         self.ensure_plugins_dir()
+        for old_id, old_inst in list(self.plugins.items()):
+            try:
+                if hasattr(old_inst, "on_unload"):
+                    old_inst.on_unload()
+            except Exception as e:
+                log.debug(f"[PluginManager] on_unload warning for {old_id}: {e}")
         self.plugins.clear()
         self.command_map.clear()
 
@@ -60,9 +66,13 @@ class PluginManager:
                 log.info(f"[PluginManager] Plugin '{plugin_id}' is disabled in manifest.")
                 return
 
+            if p_dir not in sys.path:
+                sys.path.insert(0, p_dir)
+
             # Dynamic import
             spec = importlib.util.spec_from_file_location(f"bot_plugin_{plugin_id}", py_path)
             module = importlib.util.module_from_spec(spec)
+            module.__package__ = f"plugins.{plugin_id}"
             spec.loader.exec_module(module)
 
             # Find class inheriting from BasePlugin
@@ -98,7 +108,41 @@ class PluginManager:
             importlib.reload(_c_cron)
         except Exception:
             pass
-        to_del = [k for k in list(sys.modules.keys()) if k.startswith("bot_plugin_") or k in ["scheduler_db", "scheduler", "executors", "cards.cron"]]
+        try:
+            import cards.plugin as _c_plugin
+            importlib.reload(_c_plugin)
+        except Exception:
+            pass
+        try:
+            import plugin_store as _p_store
+            _p_store._store_cache["plugins"] = None
+        except Exception:
+            pass
+        try:
+            import handlers.pipeline as _h_pipe
+            importlib.reload(_h_pipe)
+            import handlers.messages as _h_msg
+            _h_msg.process_chat_queue = _h_pipe.process_chat_queue
+            log.info("[PluginManager] Successfully reloaded handlers.pipeline module")
+        except Exception as _e_pipe:
+            log.warning(f"[PluginManager] Failed to reload handlers.pipeline: {_e_pipe}")
+        try:
+            import cards.memory as _c_mem
+            importlib.reload(_c_mem)
+            import commands as _h_cmd
+            importlib.reload(_h_cmd)
+            import handlers.messages as _h_msg
+            _h_msg.handle_slash_command = _h_cmd.handle_slash_command
+            log.info("[PluginManager] Successfully reloaded commands and cards.memory modules")
+        except Exception as _e_cmd:
+            log.warning(f"[PluginManager] Failed to reload commands: {_e_cmd}")
+        self.register_system_commands([
+            "/help", "/model", "/card", "/menu", "/project", "/note", "/notes",
+            "/status", "/context", "/quota", "/clear", "/stop", "/update", "/ping",
+            "/newproj_resolve", "/cron", "/schedule", "/plugin", "/plugins", "/user",
+            "/brain", "/auth", "/s1", "/sys1", "/system1"
+        ])
+        to_del = [k for k in list(sys.modules.keys()) if k.startswith("bot_plugin_") or k in ["scheduler_db", "scheduler", "executors", "cards.cron", "ha_client", "ha_cards"]]
         for k in to_del:
             sys.modules.pop(k, None)
         self.load_all_plugins()
