@@ -624,20 +624,34 @@ def do_p2_card_action_trigger(data: P2CardActionTrigger) -> P2CardActionTriggerR
         return P2CardActionTriggerResponse({"toast": {"type": "info", "content": "请回复您的个人偏好设定！"}})
 
     elif action_value.get("action") == "browse_recent_page":
+        # 同步在回调里回写卡片（须 <3s）。异步 toast+patch 易竞态，客户端会报 code:108002。
         target_path = action_value.get("current_path")
-        target_page = action_value.get("page", 1)
-        
-        if app_state.main_loop and app_state.main_loop.is_running():
-            async def do_browse_recent_page():
-                session_data = await get_session_async(chat_id)
-                recent_projects = session_data.get("recent_projects", [])
-                ignored_projects = session_data.get("ignored_projects", [])
-                ws_root = session_data.get("workspace_root")
-                new_card = CardBuilder.build_dir_browser_card(target_path, recent_projects, target_page, workspace_root=ws_root, ignored_projects=ignored_projects)
-                await asyncio.get_running_loop().run_in_executor(None, lambda: patch_interactive_card_sdk(card_message_id, new_card))
-            asyncio.run_coroutine_threadsafe(do_browse_recent_page(), app_state.main_loop)
-            
-        return P2CardActionTriggerResponse({"toast": {"type": "success", "content": f"正在载入第 {target_page} 页项目..."}})
+        try:
+            target_page = int(action_value.get("page", 1) or 1)
+        except (TypeError, ValueError):
+            target_page = 1
+        try:
+            from database import get_session_sync
+            from lark_client import _normalize_card_style
+
+            session_data = get_session_sync(chat_id) or {}
+            new_card = CardBuilder.build_dir_browser_card(
+                target_path,
+                session_data.get("recent_projects", []),
+                target_page,
+                workspace_root=session_data.get("workspace_root"),
+                ignored_projects=session_data.get("ignored_projects", []),
+            )
+            new_card = _normalize_card_style(new_card)
+            return P2CardActionTriggerResponse({
+                "card": {"type": "raw", "data": new_card},
+                "toast": {"type": "success", "content": f"第 {target_page} 页"},
+            })
+        except Exception as e:
+            log.error(f"[browse_recent_page] error: {e}", exc_info=True)
+            return P2CardActionTriggerResponse({
+                "toast": {"type": "error", "content": "翻页失败，请重试"}
+            })
 
     elif action_value.get("action") == "switch_cron_tab":
         tab = action_value.get("tab", "user")

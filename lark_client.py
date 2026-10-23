@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import asyncio
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import (
@@ -139,8 +140,60 @@ def send_post_to_chat_sdk(chat_id, post_content):
     except:
         return None
 
+def _normalize_card_style(card_content):
+    """Normalize legacy cards to modern unified CardKit style:
+    1. Filter out None elements from create_footer() removals.
+    2. Strip any legacy 'Powered by Antigravity' notes.
+    3. Completely remove top colored/gradient header bars, integrating
+       cleanly into the message flow without ugly gradient caps.
+    """
+    if not isinstance(card_content, dict):
+        return card_content
+    card = dict(card_content)
+
+    elements = card.get("elements")
+    clean_elems = []
+    if isinstance(elements, list):
+        for e in elements:
+            if e is None:
+                continue
+            if isinstance(e, dict) and e.get("tag") == "note":
+                sub_elems = e.get("elements", [])
+                if any("Powered by Antigravity" in str(sub.get("content", "")) for sub in sub_elems if isinstance(sub, dict)):
+                    continue
+            clean_elems.append(e)
+
+    # 彻底移除顶部渐变横幅条（header），彻底告别灰色/彩色渐变遮罩
+    header = card.pop("header", None)
+    if header and isinstance(header, dict):
+        title_obj = header.get("title", {})
+        title_text = ""
+        if isinstance(title_obj, dict):
+            title_text = title_obj.get("content", "").strip()
+        elif isinstance(title_obj, str):
+            title_text = title_obj.strip()
+
+        if title_text:
+            first_content = ""
+            if clean_elems and isinstance(clean_elems[0], dict) and clean_elems[0].get("tag") == "markdown":
+                first_content = clean_elems[0].get("content", "")
+
+            # 仅当正文首部未包含相关标题时，才在卡片首部优雅补入加粗标题（飞书卡片不支持 ### 语法）
+            key_words = [w for w in re.split(r'[\s·\-_():：]+', title_text) if len(w) >= 2]
+            has_title = any(w in first_content for w in key_words) if key_words else (title_text in first_content)
+            if not has_title:
+                clean_elems.insert(0, {
+                    "tag": "markdown",
+                    "content": f"**{title_text}**"
+                })
+
+    card["elements"] = clean_elems
+    return card
+
+
 @with_retry(max_retries=1)
 def send_interactive_card_sdk(message_id, card_content):
+    card_content = _normalize_card_style(card_content)
     req = ReplyMessageRequest.builder() \
         .message_id(message_id) \
         .request_body(ReplyMessageRequestBody.builder() \
@@ -159,6 +212,7 @@ def send_interactive_card_sdk(message_id, card_content):
 
 @with_retry(max_retries=4, initial_delay=0.6)
 def patch_interactive_card_sdk(message_id, card_content):
+    card_content = _normalize_card_style(card_content)
     req = PatchMessageRequest.builder() \
         .message_id(message_id) \
         .request_body(PatchMessageRequestBody.builder() \
@@ -220,6 +274,7 @@ def download_message_resource_sdk(message_id, file_key, resource_type, output_pa
 @with_retry(max_retries=1)
 def send_card_to_chat_sdk(chat_id, card_content):
     """Send an interactive card as a NEW message to a chat (not a reply)."""
+    card_content = _normalize_card_style(card_content)
     req = CreateMessageRequest.builder() \
         .receive_id_type("chat_id") \
         .request_body(CreateMessageRequestBody.builder()
