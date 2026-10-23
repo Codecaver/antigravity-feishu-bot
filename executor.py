@@ -590,7 +590,104 @@ def extract_final_chinese_response(text):
     text = re.sub(r'\[TASK_PLAN\].*?\[/TASK_PLAN\]\s*', '', text, flags=re.DOTALL | re.IGNORECASE).strip()
     text = re.sub(r'^\s*\[TASK_PLAN\][^\n]*(?:\n|$)', '', text, flags=re.IGNORECASE).strip()
 
+    # 10. 剥离泄漏的系统/排版指令残片（未闭合思考或模型复述规则时，正文会以半截指令开头）
+    text = re.sub(r'^[`\'"*\s]*标签内[。．.\s]*', '', text).strip()
+    text = re.sub(r'^\*{0,2}\s*内部[。．.]\s*\*{0,2}\s*', '', text).strip()
+    text = re.sub(
+        r'(?m)^\s*(?:\d+\.|[-*•])\s*遵循飞书排版规则[^\n]*\n?',
+        '',
+        text,
+    ).strip()
+    text = re.sub(
+        r'(?m)^\s*(?:\d+\.|[-*•])\s*(?:使用|请用|采用).{0,40}(?:markdown|Markdown|飞书|CardKit).{0,80}\n?',
+        '',
+        text,
+    ).strip()
+    # 行首孤立反引号 / 半截 code fence
+    text = re.sub(r'^`+\s*', '', text).strip()
+    # 模型复述的系统段标题行
+    text = re.sub(
+        r'(?m)^\[(?:System|Role|Feishu|Voice|Active|User|核心定位)[^\]]*\][^\n]*\n?',
+        '',
+        text,
+        flags=re.IGNORECASE,
+    ).strip()
+    # 残留的中英 XML/伪标签（含 </核心定位与角色>）
+    text = re.sub(r'</?[A-Za-z][\w.\-]*\b[^>]*>', '', text).strip()
+    text = re.sub(r'</?[\u4e00-\u9fff][\w\u4e00-\u9fff.\-]*\s*>', '', text).strip()
+
+    text = strip_leading_meta_preamble(text)
     return text
+
+
+def strip_leading_meta_preamble(text: str) -> str:
+    """砍掉正文开头的指令/思考残片，切到真正面向用户的答复起点。"""
+    if not text or not str(text).strip():
+        return text or ""
+    text = str(text).strip()
+    meta_re = re.compile(
+        r"(?:标签内|遵循飞书|飞书排版|CardKit|TASK_PLAN|"
+        r"System Rule|Feishu Style|核心定位|自主执行|折叠面板|点击查看|"
+        r"勿把长推理|简体中文直接|thinking|thought|"
+        r"^[*`\s]*内部[。．.]|"
+        r"^</?[\w\u4e00-\u9fff])",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    answer_re = re.compile(
+        r"^(?:#{1,3}\s+\S|"
+        r"(?:我是|我可以|我能帮|我能|我这边|你好|您好|好的|可以的|没问题|当然|"
+        r"已完成|已经|根据你|针对|关于|结论|总结|如下|以下是|简要|目前|这次|"
+        r"对于你|按你的|答：|回答：))"
+    )
+    lines = text.split("\n")
+    answer_idx = None
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if not s:
+            continue
+        if answer_re.search(s):
+            answer_idx = i
+            break
+    if answer_idx is not None and answer_idx > 0:
+        before = "\n".join(lines[:answer_idx])
+        if meta_re.search(before) or re.search(r"^[*`\s]*内部", before) or "</" in before or "<" in before:
+            return "\n".join(lines[answer_idx:]).strip()
+
+    # 逐行剥掉纯 meta 前缀行
+    while lines:
+        s = lines[0].strip()
+        if not s:
+            lines.pop(0)
+            continue
+        if meta_re.search(s) and not answer_re.search(s):
+            lines.pop(0)
+            continue
+        if re.match(r"^[*`\s]*内部[。．.]", s):
+            lines.pop(0)
+            continue
+        if re.match(r"^</?[\w\u4e00-\u9fff]", s):
+            lines.pop(0)
+            continue
+        break
+    return "\n".join(lines).strip()
+
+
+def scrub_reply_vs_reasoning(reply: str, reasoning: str) -> str:
+    """最终答复再清一遍：去掉与思考面板重叠的前缀，避免截断后「下半截」落到正文。"""
+    reply = strip_leading_meta_preamble(extract_final_chinese_response(reply or ""))
+    reasoning = (reasoning or "").strip()
+    if not reply or not reasoning:
+        return reply
+    # 若正文开头一小段已出现在思考里，整段前缀丢掉
+    for n in (160, 120, 80, 48, 24):
+        if len(reply) <= n:
+            continue
+        prefix = reply[:n]
+        if prefix in reasoning:
+            rest = reply[n:].lstrip("\n").lstrip()
+            # 避免切在汉字词中间后留下残片：再跑一轮 meta strip
+            return strip_leading_meta_preamble(rest) or rest
+    return reply
 
 
 def extract_thinking_content(text: str) -> str:
@@ -773,14 +870,49 @@ def extract_choice_card_data(reply_text, transcript_path=None, initial_transcrip
 
     return reply_text, None
 
+def _build_choice_elements(choice_card_data: Optional[dict]) -> list:
+    """Choice 区块 + 按钮，供终态单卡 elements_extra 使用。"""
+    if not choice_card_data or not choice_card_data.get("options"):
+        return []
+    opts = "\n".join(
+        f"{i}. {o}" for i, o in enumerate(choice_card_data["options"][:10], 1)
+    )
+    q = choice_card_data.get("question") or "请选择"
+    extra = [
+        {"tag": "hr"},
+        {
+            "tag": "markdown",
+            "content": f"**{q}**\n\n{opts}\n\n_(点击下方按钮或直接回复选项)_",
+        },
+    ]
+    for opt in choice_card_data["options"][:6]:
+        label = (opt[:20] + "…") if len(opt) > 20 else opt
+        extra.append({
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": label},
+            "type": "default",
+            "behaviors": [{
+                "type": "callback",
+                "value": {
+                    "action": "user_choice",
+                    "choice": opt,
+                    "label": label,
+                },
+            }],
+        })
+    return extra
+
+
 async def send_independent_final_reply(
     message_id: str,
     reply_text: str,
     choice_card_data: Optional[dict] = None,
     session_data: Optional[dict] = None,
+    reasoning_text: Optional[str] = None,
+    user_text: Optional[str] = None,
     _feishu_call=None,
 ) -> bool:
-    """以独立消息的形式发送最终回复（将过程与结果拆分成两条独立消息）。"""
+    """终态回退：新发一张含思考+答复的完整卡片（主路径已改为同卡更新）。"""
     if not reply_text or not str(reply_text).strip():
         return False
 
@@ -788,40 +920,12 @@ async def send_independent_final_reply(
     try:
         from lark_stream import build_final_markdown_card_json, create_card_entity, reply_card_by_ref
 
-        extra = []
-        if choice_card_data and choice_card_data.get("options"):
-            opts = "\n".join(
-                f"{i}. {o}" for i, o in enumerate(choice_card_data["options"][:10], 1)
-            )
-            q = choice_card_data.get("question") or "请选择"
-            extra.append({"tag": "hr"})
-            extra.append({
-                "tag": "markdown",
-                "content": f"**{q}**\n\n{opts}\n\n_(点击下方按钮或直接回复选项)_",
-            })
-            btns = []
-            for opt in choice_card_data["options"][:6]:
-                label = (opt[:20] + "…") if len(opt) > 20 else opt
-                btns.append({
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": label},
-                    "type": "default",
-                    "behaviors": [{
-                        "type": "callback",
-                        "value": {
-                            "action": "user_choice",
-                            "choice": opt,
-                            "label": label,
-                        },
-                    }],
-                })
-            extra.extend(btns)
-
+        extra = _build_choice_elements(choice_card_data)
         final_json = build_final_markdown_card_json(
             reply_text,
             elements_extra=extra or None,
-            reasoning_text=None,  # 思考过程已在上一条独立卡片中，本条不再重复
-            user_text=None,        # 独立消息不再重复引用用户问题，保持干净
+            reasoning_text=reasoning_text or None,
+            user_text=user_text,
         )
 
         card_id = await _feishu_call(lambda: create_card_entity(final_json), label="create final cardkit")
@@ -840,7 +944,7 @@ async def send_independent_final_reply(
             reply_text,
             choice_card_data=choice_card_data,
             session_data=session_data,
-            reasoning_text=None,
+            reasoning_text=reasoning_text,
         )
         msg_id = await _feishu_call(lambda: send_interactive_card_sdk(message_id, card), label="fallback card send")
         if msg_id:
@@ -1080,12 +1184,12 @@ async def execute_antigravity(
                             {"type": "meta", "userText": user_text, "chatId": chat_id},
                             push=False,
                         )
-                        label = "重新执行中…" if (attempt > 1 or is_resumed) else "思考中…"
+                        # 勿把 label 也设成「思考中…」，会与 phase 叠成「思考中… 思考中…」
+                        prog = {"type": "progress", "phase": "thinking"}
+                        if attempt > 1 or is_resumed:
+                            prog["label"] = "重新执行中…"
                         await _feishu_call(
-                            lambda: run_session.apply(
-                                {"type": "progress", "phase": "thinking", "label": label},
-                                force=True,
-                            ),
+                            lambda: run_session.apply(prog, force=True),
                             timeout=8.0,
                             label="run_session progress",
                         )
@@ -1966,6 +2070,8 @@ async def execute_antigravity(
                 if reasoning_text:
                     reasoning_text = sanitize_feishu_markdown(reasoning_text)
                 if reply_text:
+                    # 思考进折叠面板后，正文必须再剥一遍指令残片 / 与思考重叠的前缀
+                    reply_text = scrub_reply_vs_reasoning(reply_text, reasoning_text)
                     reply_text = sanitize_feishu_markdown(reply_text)
             except Exception as e:
                 log.warning(f"[Executor] reasoning compose failed: {e}")
@@ -2026,27 +2132,20 @@ async def execute_antigravity(
                                 label="run_session finish_error",
                             )
                         else:
-                            # 双消息架构：第一条收口为过程卡（思考面板+执行命令），第二条新发最终答复
-                            has_meaningful_process = bool(reasoning_text and reasoning_text.strip()) or bool(completed_tool_steps)
-                            process_summary = "_✅ 思考与步骤已完成，回复请见下方独立消息。_" if has_meaningful_process else "_✅ 处理完成_"
+                            # 单卡收口：折叠思考/过程 + 最终答复 + 可选 choice，不再拆第二条消息
+                            body = (reply_text or "").strip() if not output_blocked else ""
+                            if not body:
+                                body = "_✅ 处理完成_"
+                            extra = _build_choice_elements(choice_card_data) if not output_blocked else []
                             ok = await _feishu_call(
                                 lambda: run_session.finish_done(
-                                    process_summary,
+                                    body,
                                     reasoning=reasoning_text or "",
-                                    elements_extra=None,
+                                    elements_extra=extra or None,
                                 ),
                                 timeout=12.0,
                                 label="run_session finish_done",
                             )
-                            # 独立发送最终答复卡片
-                            if reply_text and not output_blocked:
-                                await send_independent_final_reply(
-                                    message_id,
-                                    reply_text,
-                                    choice_card_data=choice_card_data,
-                                    session_data=session_data,
-                                    _feishu_call=_feishu_call,
-                                )
                         delivered_via_cardkit = bool(ok)
                         if not ok and run_session.card_id:
                             # 再试一次 CardKit 终态卡，禁止掉进 V1 patch
@@ -2055,6 +2154,7 @@ async def execute_antigravity(
                                 reply_text or "_(空回复)_",
                                 reasoning_text=None if is_error else reasoning_text,
                                 user_text=user_text,
+                                elements_extra=_build_choice_elements(choice_card_data) or None,
                             )
                             run_session.card.failed = False
                             ok2 = await _feishu_call(
@@ -2069,12 +2169,14 @@ async def execute_antigravity(
                 try:
                     await _flush_cardkit_pushes()
                     from lark_stream import build_final_markdown_card_json
-                    has_meaningful_process = bool(reasoning_text and reasoning_text.strip()) or bool(completed_tool_steps)
-                    process_summary = "_✅ 思考与步骤已完成，回复请见下方独立消息。_" if has_meaningful_process else "_✅ 处理完成_"
+                    body = (reply_text or "").strip() if not output_blocked else ""
+                    if not body:
+                        body = "_✅ 处理完成_" if not is_error else (reply_text or "执行失败")
                     final_json = build_final_markdown_card_json(
-                        process_summary,
+                        body,
                         reasoning_text=None if is_error else reasoning_text,
                         user_text=user_text,
+                        elements_extra=_build_choice_elements(choice_card_data) or None,
                     )
                     cardkit_stream.failed = False
                     ok = await _feishu_call(
@@ -2083,14 +2185,6 @@ async def execute_antigravity(
                         label="cardkit final replace",
                     )
                     delivered_via_cardkit = bool(ok)
-                    if not is_error and reply_text and not output_blocked:
-                        await send_independent_final_reply(
-                            message_id,
-                            reply_text,
-                            choice_card_data=choice_card_data,
-                            session_data=session_data,
-                            _feishu_call=_feishu_call,
-                        )
                 except Exception as e:
                     log.warning(f"[Executor] CardKit final delivery failed: {e}")
             if not delivered_via_cardkit:
@@ -2101,30 +2195,15 @@ async def execute_antigravity(
                     importlib.reload(_resp_mod)
                 except Exception:
                     pass
-                from lark_stream import build_final_markdown_card_json, create_card_entity, reply_card_by_ref
-                final_json = build_final_markdown_card_json(
+                await send_independent_final_reply(
+                    message_id,
                     reply_text or "_(空回复)_",
+                    choice_card_data=choice_card_data,
+                    session_data=session_data,
                     reasoning_text=None if is_error else reasoning_text,
                     user_text=user_text,
+                    _feishu_call=_feishu_call,
                 )
-                new_card_id = await _feishu_call(
-                    lambda: create_card_entity(final_json),
-                    timeout=12.0,
-                    label="final-cardkit create",
-                )
-                if new_card_id and message_id:
-                    await _feishu_call(
-                        lambda: reply_card_by_ref(message_id, new_card_id),
-                        timeout=12.0,
-                        label="final-cardkit reply",
-                    )
-                else:
-                    from lark_client import send_reply_sdk
-                    fallback_text = reply_text[:2000] if reply_text else "(AI 回复卡片发送失败)"
-                    await _feishu_call(
-                        lambda: send_reply_sdk(message_id, fallback_text),
-                        label="final-card text fallback",
-                    )
 
             return {"has_reply": bool(final_reply), "returncode": process.returncode, "is_error": is_error, "is_quota_error": is_quota_exhausted}
 

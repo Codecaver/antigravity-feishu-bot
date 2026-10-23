@@ -206,12 +206,24 @@ def build_context_card(stats):
             return f"{num / 1000:.1f}K"
         return str(num)
 
-    def make_progress_bar(pct, length=12):
+    def make_progress_bar(pct, length=20):
+        """ASCII bar (■/□). Tiny usage still shows ≥1 block so it won't look stuck at empty."""
+        try:
+            pct = float(pct or 0.0)
+        except (TypeError, ValueError):
+            pct = 0.0
+        pct = max(0.0, min(100.0, pct))
         filled = int(round((pct / 100.0) * length))
+        if pct > 0 and filled == 0:
+            filled = 1
         filled = max(0, min(length, filled))
-        return "🟩" * filled + "⬜" * (length - filled)
+        return "■" * filled + "□" * (length - filled)
 
     bar_str = make_progress_bar(total_pct)
+    # 低用量时注明「已放大显示」避免误以为已占满一格
+    bar_note = ""
+    if 0 < total_pct < (100.0 / 20):
+        bar_note = " _(低用量，进度条按最小刻度显示)_"
 
     header_template = "blue"
     if total_pct > 80:
@@ -227,7 +239,11 @@ def build_context_card(stats):
         {"tag": "hr"},
         {
             "tag": "markdown",
-            "content": f"⚡ **总体上下文用量 (Total Usage)**\n`{format_k(total_tokens)} / {format_k(max_tokens)} tokens` (**{total_pct}%**)\n{bar_str}"
+            "content": (
+                f"⚡ **总体上下文用量 (Total Usage)**\n"
+                f"`{format_k(total_tokens)} / {format_k(max_tokens)} tokens` (**{total_pct}%**)\n"
+                f"`[{bar_str}]`{bar_note}"
+            ),
         },
         {"tag": "hr"},
         {

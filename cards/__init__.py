@@ -6,6 +6,7 @@ class CardBuilder:
     """Facade preserving the historical CardBuilder.* API."""
 
     _create_footer = staticmethod(common.create_footer)
+    build_input_prompt_card = staticmethod(common.build_input_prompt_card)
 
     build_model_panel = staticmethod(models.build_model_panel)
     build_model_switch_result_card = staticmethod(models.build_model_switch_result_card)

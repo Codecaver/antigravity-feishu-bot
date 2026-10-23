@@ -140,30 +140,63 @@ def send_post_to_chat_sdk(chat_id, post_content):
     except:
         return None
 
+def _normalize_feishu_list_markdown(content: str) -> str:
+    """把手写圆点改成飞书 markdown 原生列表语法（`- ` / 已有 `1.` 不动）。"""
+    if not content:
+        return content
+    # • · ▪ ◦ → `- `
+    out = re.sub(r"(?m)^([\t ]*)[•·▪◦]\s+", r"\1- ", content)
+    # 非列表行后紧贴 `- `/`1.` 时补空行，否则飞书常当成普通文本
+    out = re.sub(
+        r"(?m)^(?![\t ]*(?:- |\d+\. ))(.+\S)\n(?=[\t ]*(?:- |\d+\. ))",
+        r"\1\n\n",
+        out,
+    )
+    return out
+
+
 def _normalize_card_style(card_content):
-    """Normalize legacy cards to modern unified CardKit style:
+    """Single choke-point for interactive card style (Card 1.0 + CardKit 2.0).
+
+    All interactive egress MUST go through send_interactive_card_sdk /
+    patch_interactive_card_sdk / send_card_to_chat_sdk, or callback helper
+    that calls this function. Do not call im.v1.message.create with raw card JSON.
+
     1. Filter out None elements from create_footer() removals.
     2. Strip any legacy 'Powered by Antigravity' notes.
-    3. Completely remove top colored/gradient header bars, integrating
-       cleanly into the message flow without ugly gradient caps.
+    3. Remove top-level colored header bars (keep collapsible_panel headers).
+    4. Normalize handwritten bullets into Feishu native markdown lists.
     """
     if not isinstance(card_content, dict):
         return card_content
     card = dict(card_content)
 
-    elements = card.get("elements")
-    clean_elems = []
-    if isinstance(elements, list):
-        for e in elements:
-            if e is None:
-                continue
-            if isinstance(e, dict) and e.get("tag") == "note":
-                sub_elems = e.get("elements", [])
-                if any("Powered by Antigravity" in str(sub.get("content", "")) for sub in sub_elems if isinstance(sub, dict)):
-                    continue
-            clean_elems.append(e)
+    # Card 1.0: elements[]; CardKit 2.0: body.elements[]
+    body = card.get("body")
+    if isinstance(body, dict) and isinstance(body.get("elements"), list):
+        elems_owner = dict(body)
+        elems_key = "body"
+        raw_elems = list(elems_owner.get("elements") or [])
+    else:
+        elems_owner = card
+        elems_key = "elements"
+        raw_elems = list(card.get("elements") or []) if isinstance(card.get("elements"), list) else []
 
-    # 彻底移除顶部渐变横幅条（header），彻底告别灰色/彩色渐变遮罩
+    clean_elems = []
+    for e in raw_elems:
+        if e is None:
+            continue
+        if isinstance(e, dict) and e.get("tag") == "note":
+            sub_elems = e.get("elements", [])
+            if any("Powered by Antigravity" in str(sub.get("content", "")) for sub in sub_elems if isinstance(sub, dict)):
+                continue
+        # 手写 •/· 子弹不成飞书原生列表；统一成 markdown `- ` / 保留已有 `1.`
+        if isinstance(e, dict) and e.get("tag") == "markdown" and isinstance(e.get("content"), str):
+            e = dict(e)
+            e["content"] = _normalize_feishu_list_markdown(e["content"])
+        clean_elems.append(e)
+
+    # 只剥卡片顶栏 header（带 template 的彩条）；不动折叠面板内部 header
     header = card.pop("header", None)
     if header and isinstance(header, dict):
         title_obj = header.get("title", {})
@@ -178,7 +211,6 @@ def _normalize_card_style(card_content):
             if clean_elems and isinstance(clean_elems[0], dict) and clean_elems[0].get("tag") == "markdown":
                 first_content = clean_elems[0].get("content", "")
 
-            # 仅当正文首部未包含相关标题时，才在卡片首部优雅补入加粗标题（飞书卡片不支持 ### 语法）
             key_words = [w for w in re.split(r'[\s·\-_():：]+', title_text) if len(w) >= 2]
             has_title = any(w in first_content for w in key_words) if key_words else (title_text in first_content)
             if not has_title:
@@ -187,8 +219,16 @@ def _normalize_card_style(card_content):
                     "content": f"**{title_text}**"
                 })
 
-    card["elements"] = clean_elems
+    if elems_key == "body":
+        elems_owner["elements"] = clean_elems
+        card["body"] = elems_owner
+    else:
+        card["elements"] = clean_elems
     return card
+
+
+# Public alias — plugins / handlers should import this name when needed.
+normalize_card_style = _normalize_card_style
 
 
 @with_retry(max_retries=1)

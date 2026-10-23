@@ -57,9 +57,21 @@ def build_streaming_card_json(text: str, streaming: bool = True) -> dict:
     }
 
 
+def _truncate_reasoning_body(body: str, limit: int = 5000) -> str:
+    if len(body) <= limit:
+        return body
+    cut = body[: limit - 30]
+    for sep in ("\n\n", "\n", "。", ". ", "；", "; "):
+        idx = cut.rfind(sep)
+        if idx >= limit // 3:
+            cut = cut[: idx + len(sep)].rstrip()
+            break
+    return cut + "\n\n_(思考过长已截断)_"
+
+
 def build_reasoning_collapsible(reasoning_text: str, expanded: bool = False) -> dict:
     """对齐 lark-agent-bridge：可折叠思考面板。"""
-    body = (reasoning_text or "").strip() or "_（无详细思考内容）_"
+    body = _truncate_reasoning_body((reasoning_text or "").strip()) or "_（无详细思考内容）_"
     title = "🧠 **思考中**" if expanded else "🧠 **思考完成，点击查看**"
     return {
         "tag": "collapsible_panel",
@@ -112,11 +124,14 @@ def build_final_markdown_card_json(
     )
     if elements_extra:
         body_elements.extend(elements_extra)
+    # 与正文空一行（不要 &nbsp;+\n\n，飞书里会变成空两行）
+    body_elements.append({"tag": "markdown", "content": "\n_✅ 已完成_"})
     return {
         "schema": "2.0",
         "config": {
             "streaming_mode": False,
-            "summary": {"content": _summary(text or "")},
+            # 会话列表预览用短状态，勿塞整段正文
+            "summary": {"content": "已完成"},
         },
         "body": {"elements": body_elements},
     }
@@ -280,6 +295,12 @@ def reply_card_by_ref(message_id: str, card_id: str) -> Optional[str]:
 
 
 def _create_card_entity(card_json: dict) -> Optional[str]:
+    # CardKit create 也走统一样式（去顶栏）；流式 2.0 卡本身通常无 header.template
+    try:
+        from lark_client import normalize_card_style
+        card_json = normalize_card_style(card_json)
+    except Exception:
+        pass
     req = (
         CreateCardRequest.builder()
         .request_body(

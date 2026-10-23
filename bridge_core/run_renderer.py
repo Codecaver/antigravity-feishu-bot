@@ -53,7 +53,7 @@ def render_card(state: Dict[str, Any], elements_extra: Optional[List[dict]] = No
             )
             body_added = True
 
-    # choice / 额外按钮放在「已完成」之前
+    # choice / 额外按钮放在完成标记之前
     if elements_extra:
         elements.extend(elements_extra)
 
@@ -63,11 +63,27 @@ def render_card(state: Dict[str, Any], elements_extra: Optional[List[dict]] = No
         msg = state.get("errorMsg") or "agent 失败"
         elements.append(_note(f"⚠️ {msg}"))
     elif terminal == "done":
+        # 正文可为空时补占位；无论有无正文，底部都给完成标记，方便确认已结束
         if not body_added:
-            elements.append(_note("_✅ 思考与步骤已完成_"))
+            elements.append(
+                {
+                    "tag": "markdown",
+                    "element_id": "md_body",
+                    "content": "_(空回复)_",
+                }
+            )
+        # 与正文空一行（不要 &nbsp;+\n\n，飞书里会变成空两行）
+        elements.append({"tag": "markdown", "content": "\n_✅ 已完成_"})
 
     if terminal == "running":
         activity = _activity_text(state)
+        # 思考面板标题已是「思考中…」，底部再写一遍会变成「思考中… 思考中…」
+        if (
+            reasoning.get("active")
+            and activity
+            and re.sub(r"[.…]+$", "", activity.strip()) == "思考中"
+        ):
+            activity = ""
         if activity:
             elements.append(
                 {
@@ -126,10 +142,22 @@ def _note(md: str) -> dict:
     return {"tag": "markdown", "content": f"_{md}_" if not md.startswith("_") else md}
 
 
+def _truncate_reasoning(body: str, limit: int = REASONING_MAX) -> str:
+    """按段落边界截断，避免思考面板在句子中间被砍断（看起来像溢出到正文）。"""
+    if len(body) <= limit:
+        return body
+    cut = body[: limit - 30]
+    for sep in ("\n\n", "\n", "。", ". ", "；", "; "):
+        idx = cut.rfind(sep)
+        if idx >= limit // 3:
+            cut = cut[: idx + len(sep)].rstrip()
+            break
+    return cut + "\n\n_(思考过长已截断)_"
+
+
 def _reasoning_panel(content: str, active: bool) -> dict:
     body = sanitize_feishu_markdown((content or "").strip())
-    if len(body) > REASONING_MAX:
-        body = body[: REASONING_MAX - 1] + "…"
+    body = _truncate_reasoning(body)
     body = body or "_（无详细思考内容）_"
     if active:
         title = "🧠 **思考中…**"
@@ -203,7 +231,7 @@ def _tool_panel(tool: dict, highlight: bool = False) -> dict:
 def _activity_text(state: Dict[str, Any]) -> str:
     act = state.get("activity") or {}
     phase = act.get("phase") or state.get("footer") or ""
-    label = act.get("label") or ""
+    label = (act.get("label") or "").strip()
     if act.get("kind") == "tool":
         return f"正在执行：{act.get('label') or act.get('name') or 'tool'}…"
     mapping = {
@@ -213,12 +241,25 @@ def _activity_text(state: Dict[str, Any]) -> str:
         "tool": "执行工具中…",
     }
     base = mapping.get(phase, phase or "处理中…")
-    if label:
-        return f"{base} {label}"
-    return base
+    if not label:
+        return base
+
+    def _stem(s: str) -> str:
+        return re.sub(r"[.….\s]+$", "", s)
+
+    # phase 与 label 同义时不要叠成「思考中… 思考中…」
+    if _stem(label) == _stem(base) or base in label or label in base:
+        return label if len(label) >= len(base) else base
+    # 思考阶段的附加信息（等待/重试）单独展示即可
+    if phase == "thinking" and (
+        label.startswith("已等待") or "重新执行" in label or "重试" in label
+    ):
+        return label
+    return f"{base} {label}"
 
 
 def _summary_text(state: Dict[str, Any], max_chars: int = 40) -> str:
+    """会话列表预览文案（非卡片正文）。终态固定短状态，对齐 Cursor bridge。"""
     terminal = state.get("terminal")
     if terminal == "running":
         return _activity_text(state)[:max_chars]
@@ -226,15 +267,8 @@ def _summary_text(state: Dict[str, Any], max_chars: int = 40) -> str:
         return "失败"
     if terminal == "interrupted":
         return "已中断"
-    text = ""
-    for b in reversed(state.get("blocks") or []):
-        if b.get("kind") == "text" and (b.get("content") or "").strip():
-            text = b["content"]
-            break
-    cleaned = re.sub(r"\s+", " ", (text or "").strip())
-    if not cleaned:
-        return "已完成"
-    return cleaned if len(cleaned) <= max_chars else cleaned[: max_chars - 1] + "…"
+    # done / 其它终态：列表里只显示「已完成」，不把整段正文塞进预览
+    return "已完成"
 
 
 def _stop_button(run_id: str, chat_id: str, card_id: str = "") -> dict:
