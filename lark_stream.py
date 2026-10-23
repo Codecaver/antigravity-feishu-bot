@@ -70,33 +70,15 @@ def _truncate_reasoning_body(body: str, limit: int = 5000) -> str:
 
 
 def build_reasoning_collapsible(reasoning_text: str, expanded: bool = False) -> dict:
-    """对齐 lark-agent-bridge：可折叠思考面板。"""
+    """思考过程用飞书引用竖条（>），不再用折叠面板。"""
+    from utils.feishu_markdown import as_feishu_quote
+
     body = _truncate_reasoning_body((reasoning_text or "").strip()) or "_（无详细思考内容）_"
-    title = "🧠 **思考中**" if expanded else "🧠 **思考完成，点击查看**"
+    title = "_🧠 思考中…_" if expanded else "_🧠 思考过程_"
     return {
-        "tag": "collapsible_panel",
-        "expanded": bool(expanded),
-        "header": {
-            "title": {"tag": "markdown", "content": title},
-            "vertical_align": "center",
-            "icon": {
-                "tag": "standard_icon",
-                "token": "down-small-ccm_outlined",
-                "size": "16px 16px",
-            },
-            "icon_position": "follow_text",
-            "icon_expanded_angle": -180,
-        },
-        "border": {"color": "grey", "corner_radius": "5px"},
-        "vertical_spacing": "8px",
-        "padding": "8px 8px 8px 8px",
-        "elements": [
-            {
-                "tag": "markdown",
-                "content": body,
-                "text_size": "notation",
-            }
-        ],
+        "tag": "markdown",
+        "content": f"{title}\n\n{as_feishu_quote(body)}",
+        "text_size": "notation",
     }
 
 
@@ -106,13 +88,11 @@ def build_final_markdown_card_json(
     reasoning_text: Optional[str] = None,
     user_text: Optional[str] = None,
 ) -> dict:
-    """Schema 2.0 final card (streaming off)，可选保留思考折叠面板与用户引用。"""
-    from utils.feishu_markdown import format_user_quote, sanitize_feishu_markdown
+    """Schema 2.0 final card (streaming off)，可选保留思考折叠面板。"""
+    from utils.feishu_markdown import sanitize_feishu_markdown
 
     body_elements = []
-    quote = format_user_quote(user_text or "")
-    if quote:
-        body_elements.append({"tag": "markdown", "content": quote})
+    # 不在正文再引用 user_text：会话里已有原生 reply 引用
     if reasoning_text and reasoning_text.strip():
         body_elements.append(build_reasoning_collapsible(reasoning_text, expanded=False))
     body_elements.append(

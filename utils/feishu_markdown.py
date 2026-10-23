@@ -237,3 +237,19 @@ def sanitize_feishu_markdown(text: str) -> str:
             parts.append(_sanitize_prose(chunk))
     # Collapse 3+ blank lines
     return re.sub(r"\n{3,}", "\n\n", "".join(parts)).strip()
+
+
+def as_feishu_quote(text: str) -> str:
+    """把多行文本转成飞书 markdown 引用块（左侧竖条），用于思考/执行过程。"""
+    if not text:
+        return ">"
+    lines = str(text).replace("\r\n", "\n").split("\n")
+    out = []
+    for line in lines:
+        if not line.strip():
+            out.append(">")
+        elif line.startswith(">"):
+            out.append(line)
+        else:
+            out.append(f"> {line}")
+    return "\n".join(out)

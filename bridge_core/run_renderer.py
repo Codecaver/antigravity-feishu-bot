@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional
 
-from utils.feishu_markdown import format_user_quote, sanitize_feishu_markdown
+from utils.feishu_markdown import as_feishu_quote, sanitize_feishu_markdown
 
 REASONING_MAX = 5000
 COLLAPSE_TOOL_THRESHOLD = 3
@@ -15,11 +15,7 @@ def render_card(state: Dict[str, Any], elements_extra: Optional[List[dict]] = No
     elements: List[dict] = []
     terminal = state.get("terminal") or "running"
 
-    # Bridge-like：顶部引用用户原话
-    quote_md = format_user_quote(state.get("userText") or "")
-    if quote_md:
-        elements.append({"tag": "markdown", "content": quote_md})
-
+    # 不在正文重复引用用户原话：飞书原生「回复 xxx」已有，再 quote 一层多余
     reasoning = state.get("reasoning") or {}
     if reasoning.get("content"):
         elements.append(_reasoning_panel(reasoning.get("content") or "", bool(reasoning.get("active"))))
@@ -40,10 +36,12 @@ def render_card(state: Dict[str, Any], elements_extra: Optional[List[dict]] = No
         else:
             elements.extend(_render_tool_group(group.get("tools") or [], finalized=terminal != "running"))
 
-    # 运行中：若非思考中，保留 md_body 占位便于后续 patch；思考中时不塞无意义省略号
+    # 运行中：仅在还没有任何可见内容时放 md_body 占位（便于后续打字机 patch）。
+    # 已有思考引用 / 工具步骤时再塞「…」会显得多余。
     if terminal == "running" and not body_added:
-        is_thinking = bool(reasoning.get("active") and reasoning.get("content"))
-        if not is_thinking:
+        has_tools = any((b.get("kind") == "tool") for b in (state.get("blocks") or []))
+        has_reasoning = bool((reasoning.get("content") or "").strip())
+        if not has_tools and not has_reasoning:
             elements.append(
                 {
                     "tag": "markdown",
@@ -156,35 +154,18 @@ def _truncate_reasoning(body: str, limit: int = REASONING_MAX) -> str:
 
 
 def _reasoning_panel(content: str, active: bool) -> dict:
+    """思考过程用飞书引用格式（>），不再用折叠面板。"""
     body = sanitize_feishu_markdown((content or "").strip())
     body = _truncate_reasoning(body)
     body = body or "_（无详细思考内容）_"
     if active:
-        title = "🧠 **思考中…**"
+        title = "_🧠 思考中…_"
         display_body = body + " ▌"
     else:
-        title = "🧠 **思考完成，点击查看**"
+        title = "_🧠 思考过程_"
         display_body = body
-
-    return {
-        "tag": "collapsible_panel",
-        "expanded": bool(active),
-        "header": {
-            "title": {"tag": "markdown", "content": title},
-            "vertical_align": "center",
-            "icon": {
-                "tag": "standard_icon",
-                "token": "down-small-ccm_outlined",
-                "size": "16px 16px",
-            },
-            "icon_position": "follow_text",
-            "icon_expanded_angle": -180,
-        },
-        "border": {"color": "grey", "corner_radius": "5px"},
-        "vertical_spacing": "8px",
-        "padding": "8px 8px 8px 8px",
-        "elements": [{"tag": "markdown", "content": display_body, "text_size": "notation"}],
-    }
+    md = f"{title}\n\n{as_feishu_quote(display_body)}"
+    return {"tag": "markdown", "content": md, "text_size": "notation"}
 
 
 def _group_blocks(blocks: List[Dict[str, Any]]):
@@ -204,17 +185,30 @@ def _group_blocks(blocks: List[Dict[str, Any]]):
 def _render_tool_group(tools: List[dict], finalized: bool) -> List[dict]:
     if not tools:
         return []
+    if finalized:
+        # 终态：步骤已并入思考引用块，外部不再平铺
+        return []
     if len(tools) < COLLAPSE_TOOL_THRESHOLD:
         return [_tool_panel(t) for t in tools]
-    if finalized:
-        # 终态时所有命令与步骤已完整收拢进「思考完成，点击查看」折叠面板中，外部不再冗余平铺
-        return []
     prior = tools[:-1]
     latest = tools[-1]
     out: List[dict] = []
     if prior:
-        names = "、".join((t.get("label") or t.get("name") or "tool")[:32] for t in prior[:6])
-        out.append(_note(f"🛠️ 已完成 {len(prior)} 步：{names}"))
+        # 已完成步骤也用引用竖条，和 Cursor bridge 一致
+        lines = []
+        for t in prior[-8:]:
+            lab = (t.get("label") or t.get("name") or "tool").strip()[:80]
+            lines.append(f"✅ {lab}")
+        if len(prior) > 8:
+            lines.append(f"_…另有 {len(prior) - 8} 步_")
+        quote_body = as_feishu_quote("\n".join(lines))
+        out.append(
+            {
+                "tag": "markdown",
+                "content": f"_🛠️ 已完成 {len(prior)} 步_\n\n{quote_body}",
+                "text_size": "notation",
+            }
+        )
     out.append(_tool_panel(latest, highlight=True))
     return out
 
@@ -223,9 +217,14 @@ def _tool_panel(tool: dict, highlight: bool = False) -> dict:
     label = (tool.get("label") or tool.get("name") or "tool").strip()
     status = tool.get("status") or "running"
     icon = "⏳" if status == "running" else ("✅" if status == "done" else "⚠️")
-    prefix = "**" if highlight else ""
-    suffix = "**" if highlight else ""
-    return {"tag": "markdown", "content": f"{icon} {prefix}{label}{suffix}"}
+    line = f"{icon} {label}"
+    if highlight:
+        line = f"**{line}**"
+    return {
+        "tag": "markdown",
+        "content": as_feishu_quote(line),
+        "text_size": "notation",
+    }
 
 
 def _activity_text(state: Dict[str, Any]) -> str:
