@@ -11,6 +11,8 @@ pip-delete-this-directory.txt
 # State and logs
 chat_sessions.json
 user_profiles.json
+.model_cache.json
+.register_app_state.json
 agy_log_*.txt
 *.log
 logs/
