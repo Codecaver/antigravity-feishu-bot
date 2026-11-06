@@ -26,7 +26,7 @@ _FILE_MD_LINK = re.compile(
 _BARE_FILE_URL = re.compile(r"file://(/[^\s\)\]\>]+)", re.IGNORECASE)
 _ANGLE_FILE = re.compile(r"<(?:file://)?(/Users/[^\s>]+|/home/[^\s>]+|/tmp/[^\s>]+)>")
 _BARE_ABS_PATH = re.compile(
-    r"(?<![`\w])((?:/Users|/home|/private/var|/var/folders|/tmp|/opt)/[^\s`\"'<>\]\)]+)"
+    r"(?<![`\w/:])((?:/Users|/home|/private/var|/var/folders|/tmp|/opt)/[^\s`\"'<>\]\)]+)"
 )
 
 _CLOSED_FENCE = re.compile(r"```([^\n`]*)\n([\s\S]*?)\n```")
@@ -155,6 +155,9 @@ def _sanitize_prose(text: str) -> str:
 
     def _link_sub(m: re.Match) -> str:
         label, target = m.group(1), m.group(2)
+        clean_target = (target or "").strip()
+        if clean_target.lower().startswith(("http://", "https://", "mailto:", "lark://", "feishu://")):
+            return f"[{label}]({clean_target})"
         pretty = _pretty_path(target)
         label_pathish = ("/" in label) or label.endswith(
             (".py", ".ts", ".js", ".md", ".go", ".rs", ".tsx", ".jsx")
