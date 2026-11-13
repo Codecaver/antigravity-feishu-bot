@@ -46,7 +46,8 @@ module.exports = {
         SSL_CERT_FILE: cert,
         REQUESTS_CA_BUNDLE: cert,
         CURL_CA_BUNDLE: cert,
-        ...(geminiKey ? { GEMINI_API_KEY: geminiKey } : {}),
+        // Account-login mode: do not inject GEMINI_API_KEY (forces API-key auth).
+        // ...(geminiKey ? { GEMINI_API_KEY: geminiKey } : {}),
       },
     },
   ],
