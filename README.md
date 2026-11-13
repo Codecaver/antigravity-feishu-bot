@@ -127,32 +127,32 @@
 
 ```mermaid
 flowchart TD
-    User["飞书客户端（用户 / 群聊 / 语音条）"] -->|WebSocket Lark OAPI| Main["main.py（事件分发器）"]
-    Main --> Pre["handlers/messages.py（消息防抖与指令路由）"]
+    User["飞书客户端 (用户 / 群聊 / 语音条)"] -->|"WebSocket Lark OAPI"| Main["main.py (事件分发器)"]
+    Main --> Pre["handlers/messages.py (消息防抖与指令路由)"]
     
-    Pre -->|Slash 命令（/project /s1 /plugins 等）| Cmd["commands.py（交互式卡片渲染）"]
+    Pre -->|"Slash 命令 (/project /s1 /plugins 等)"| Cmd["commands.py (交互式卡片渲染)"]
+    Pre -->|"自然语言请求"| Gate{"System One 决策网关<br/>Jev Engine"}
     
-    Pre -->|自然语言请求| Gate{"System One 决策网关<br/>(Jev Engine)"}
-    
-    Gate -->|高频意图直达| FastPath["Fast-Path 极速插件总线<br/>(小于 200ms)"]
-    FastPath -->|系统健康| HealthPlug["server_health 插件"]
-    FastPath -->|随身便签| NotePlug["notes_manager 插件"]
-    FastPath -->|定时计划| CronPlug["cron_scheduler 插件"]
-    FastPath -->|智能家居| HAPlug["home_assistant 插件"]
+    Gate -->|"高频意图直达"| FastPath["Fast-Path 极速插件总线<br/>低于 200ms"]
+    FastPath -->|"系统健康"| HealthPlug["server_health 插件"]
+    FastPath -->|"随身便签"| NotePlug["notes_manager 插件"]
+    FastPath -->|"定时计划"| CronPlug["cron_scheduler 插件"]
+    FastPath -->|"智能家居"| HAPlug["home_assistant 插件"]
     HealthPlug --> CardUI["飞书原生交互式卡片"]
     NotePlug --> CardUI
     CronPlug --> CardUI
     HAPlug --> CardUI
 
-    Gate -->|拦截安全隐患| RejectCard["安全风控拦截告警卡片"] --> CardUI
+    Gate -->|"拦截安全隐患"| RejectCard["安全风控拦截告警卡片"]
+    RejectCard --> CardUI
     
-    Gate -->|复杂工程任务| AgentQueue["会话异步排队队列（chat_id）"]
-    AgentQueue --> Adapter["自适应推理档位对齐（Effort Matcher）"]
-    Adapter --> Executor["executor.py（Antigravity CLI 引擎）"]
+    Gate -->|"复杂工程任务"| AgentQueue["会话异步排队队列 (chat_id)"]
+    AgentQueue --> Adapter["自适应推理档位对齐 (Effort Matcher)"]
+    Adapter --> Executor["executor.py (Antigravity CLI 引擎)"]
     
-    Executor -->|Task Plan 步骤流转| CardUI
-    Executor -->|执行 Shell / 读写代码| HostFS["宿主机操作系统 & 工作区"]
-    Executor -->|产出图像/文件回传| MultiModal["handlers/media.py（飞书富媒体通道）"]
+    Executor -->|"Task Plan 步骤流转"| CardUI
+    Executor -->|"执行 Shell / 读写代码"| HostFS["宿主机操作系统 & 工作区"]
+    Executor -->|"产出图像 / 文件回传"| MultiModal["handlers/media.py (飞书富媒体通道)"]
     MultiModal --> CardUI
     CardUI --> User
 ```
