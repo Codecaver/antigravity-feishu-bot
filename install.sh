@@ -135,7 +135,7 @@ echo "✅ 环境检测通过 (python3, pm2, agy)"
 echo ""
 
 # --- 2. 源码获取与更新 ---
-REPO_URL="https://github.com/Level6me/antigravity-feishu-bot.git"
+REPO_URL="https://github.com/Codecaver/antigravity-feishu-bot.git"
 if [ ! -f "main.py" ]; then
     echo "⚠️ 未在当前目录检测到核心文件 (main.py)，准备克隆或更新代码仓库..."
     if [ ! -d "antigravity-feishu-bot" ]; then

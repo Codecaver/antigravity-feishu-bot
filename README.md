@@ -227,7 +227,7 @@ python wizard.py grant drive       # 例：云文档
 在服务器终端直接执行：
 
 ```bash
-bash <(curl -sL https://raw.githubusercontent.com/Level6me/antigravity-feishu-bot/main/install.sh)
+bash <(curl -sL https://raw.githubusercontent.com/Codecaver/antigravity-feishu-bot/main/install.sh)
 ```
 
 脚本会构建虚拟环境、安装依赖，并在配置飞书凭据时提供二选一：
@@ -251,7 +251,7 @@ chmod +x install.sh
 
 ```bash
 # 1. 克隆代码仓库
-git clone https://github.com/Level6me/antigravity-feishu-bot.git
+git clone https://github.com/Codecaver/antigravity-feishu-bot.git
 cd antigravity-feishu-bot
 
 # 2. 创建并激活 Python 虚拟环境
