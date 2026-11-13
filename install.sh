@@ -219,8 +219,8 @@ if [ "$configure_env" = true ]; then
         echo "✅ .env 配置文件已成功生成。"
     else
         echo "📱 即将打开扫码向导，请用飞书 App 扫码…"
-        if ! python wizard.py setup; then
-            echo "❌ 扫码创建失败。可改选手动填写，或稍后执行: python wizard.py setup"
+        if ! python3 wizard.py setup; then
+            echo "❌ 扫码创建失败。可改选手动填写，或稍后执行: python3 wizard.py setup"
             exit 1
         fi
         echo "✅ 扫码创建完成，凭据已写入 .env。"
