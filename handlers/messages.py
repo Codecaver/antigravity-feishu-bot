@@ -55,6 +55,8 @@ async def _handle_message_async_internal(message_id, chat_id, message_type, cont
                 for elem in line:
                     if elem.get("tag") == "text":
                         texts.append(elem.get("text", ""))
+                    elif elem.get("tag") == "code_block":
+                        texts.append(elem.get("text", ""))
                     elif elem.get("tag") == "a":
                         texts.append(elem.get("href", elem.get("text", "")))
         raw_text = " ".join(texts).strip()

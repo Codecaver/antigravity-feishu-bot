@@ -40,6 +40,10 @@ async def _process_post_message(loop, message_id, content_json):
         for elem in line:
             if elem.get("tag") == "text":
                 texts.append(elem.get("text", ""))
+            elif elem.get("tag") == "code_block":
+                texts.append(elem.get("text", ""))
+            elif elem.get("tag") == "a":
+                texts.append(elem.get("href", elem.get("text", "")))
             elif elem.get("tag") == "img":
                 image_keys.append(elem.get("image_key", ""))
     
